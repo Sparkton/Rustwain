@@ -20,6 +20,7 @@ Rustwain is a ground-up re-imagining of Kubernetes in Rust. The goal is a cross-
 - Every code change goes through the 3-1 workflow: three parallel Sonnet implementers managed by one Opus orchestrator that writes no logic itself.
 - Keep each PR to one ticket with explicit acceptance criteria.
 - Do not commit, push, or open PRs without the user's go-ahead.
+- Never add a `Co-Authored-By: Claude ...` trailer (or any AI co-author or attribution line) to commit messages or PR descriptions.
 
 ## Agent Instructions
 
