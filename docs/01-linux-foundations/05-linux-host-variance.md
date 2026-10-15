@@ -8,7 +8,8 @@ compiled-in features, init system, libc, security module, firewall backend, netw
 manager, filesystem, CPU architecture, page size and default sysctls. An orchestrator
 that assumes one combination breaks on the others in ways that are confusing to debug.
 This document lists every axis of variation we know of, how we detect it, and what we do
-about it.
+about it. For a per-distro lookup table of defaults and the exact probe behind each
+feature, see the [kernel feature matrix](07-kernel-feature-matrix.md).
 
 ## Strategy
 

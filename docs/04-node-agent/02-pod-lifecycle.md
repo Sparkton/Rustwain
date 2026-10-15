@@ -165,6 +165,159 @@ Every stage is resumable from the checkpoint:
   (monotonic-ish: stored as wall time + boot ID; if boot ID changed, the pod is dead
   anyway).
 
+### Crash-recovery walkthrough: the agent dies at each stage
+
+The rules above are easy to state and easy to get wrong. This section walks one pod
+(`uid=7c1e…`, two init containers, one sidecar, one main container, a PVC, one IPv6+IPv4
+address) through every stage and asks: *the agent process is SIGKILLed right here –
+what is on disk, what is running, and what does the restarted agent do?*
+
+#### Three rules that make every case work
+
+1. **Intent before effect.** Any step with a host side effect first writes an *intent*
+   record to the checkpoint DB (`agent.db`, redb, one fsynced transaction), then
+   performs the effect, then writes *done*. Recovery treats `intent` without `done` as
+   "may or may not have happened" and re-runs the step, which must be idempotent.
+2. **Everything on the host is named by pod UID.** cgroup `rustwain.slice/pod-7c1e….scope`,
+   netns `/run/rustwain/netns/7c1e…`, mounts under `/var/lib/rustwain/pods/7c1e…/`, BPF
+   `endpoints` entries tagged with UID, supervisor socket `/run/rustwain/sup/7c1e….sock`.
+   So recovery can always find what exists, and **orphan GC** can always tell whose it is.
+3. **Supervisors outlive the agent.** Each pod's supervisor is its own process (not a
+   child the agent reaps), holds the namespaces, reaps container processes and records
+   their exits with a monotonically increasing `event_seq`. It keeps the last 256 events
+   in memory and replays from the agent's `last_acked_seq` on reconnect.
+
+#### Recovery entry point
+
+```
+agent start (epoch := epoch + 1, persisted)
+  │
+  ├─ 1. open agent.db; load PodRecords (state, intents, allocations, last_acked_seq)
+  ├─ 2. scan host: cgroups under rustwain.slice, /run/rustwain/sup/*.sock,
+  │     /run/rustwain/netns/*, mounts under /var/lib/rustwain/pods/*, pinned BPF
+  │     endpoint entries
+  ├─ 3. join: for each UID → (record?, host artifacts?)
+  │       record + artifacts  → resume at recorded stage (table below)
+  │       record, no artifacts→ effects never happened / were lost (reboot): re-run
+  │       artifacts, no record→ orphan: tear down (unmount, kill cgroup, delete netns,
+  │                             remove BPF entry) — never adopt unknown state
+  ├─ 4. reconnect supervisors; replay events since last_acked_seq
+  ├─ 5. start API watch; reconcile desired (API) vs recovered (local)
+  └─ 6. only now admit *new* pods (allocators are consistent again)
+```
+
+Step 6 matters: admitting a new pod before step 3 finishes could hand out an IP or CPU
+set that a recovering pod still holds. Kubernetes' kubelet has had several bugs of
+exactly this shape (CPU manager state vs running containers, device manager checkpoint
+vs DRA).
+
+#### Stage by stage
+
+```
+ agent        agent.db               host                   supervisor     API
+   │  (A) watch event: pod 7c1e bound to this node                          │
+   │◀────────────────────────────────────────────────────────────────────────│
+   ✖ crash A: nothing written. Restart re-receives the pod from the watch.   │
+   │                                                                          │
+   │ admit ok ──▶ PodRecord{Admitted, spec_hash}                              │
+   │ status Admitted ───────────────────────────────────────────────────────▶│
+   ✖ crash B: record exists, no intents. Resume at Preparing. If spec_hash    │
+   │          ≠ API spec (pod replaced with same name) → UID differs anyway.  │
+   │                                                                          │
+   │ intent{ip} ─▶ bitmap bit set + intent, same txn                          │
+   ✖ crash C1: IP reserved in bitmap, not yet programmed. Recovery re-runs    │
+   │           ip step: allocate(uid) returns the same IP (keyed by UID).     │
+   │ intent{image pull ×4} → pulling (content store dedups by digest)         │
+   ✖ crash C2: partial layer downloads exist as *ingest* files; pull resumes  │
+   │           with HTTP Range from the ingest offset, digest verified at end.│
+   │ intent{mount pvc} ─────────────────▶ mount(…/7c1e/volumes/data)          │
+   ✖ crash C3: mount may or may not exist. Recovery checks /proc/self/        │
+   │           mountinfo for the exact target + source; mounted → mark done,  │
+   │           not mounted → retry. Never mount twice.                        │
+   │ done{all prepare} ─▶ PodRecord{Prepared}                                 │
+   │                                                                          │
+   │ intent{sandbox} ─▶                                                       │
+   │ spawn supervisor ─────────────────▶ cgroup + netns + sup socket          │
+   ✖ crash D: supervisor may be alive without the agent ever having heard     │
+   │          "ready". Recovery finds sup socket → connect → ask state:       │
+   │          SandboxReady → done; still starting → wait; socket missing but  │
+   │          cgroup exists → supervisor died mid-setup → kill cgroup, delete │
+   │          netns, redo sandbox (cheap: < 50 ms).                           │
+   │ dataplane: wire netns, endpoints[ip] := {ifindex, uid, identity}         │
+   ✖ crash D2: BPF endpoint entry is pinned → survives. Recovery compares     │
+   │           pinned entry's ifindex with the netkit device in the netns;    │
+   │           mismatch (device recreated) → rewrite entry.                   │
+   │                                                                          │
+   │ init-1 start ───────────────────────────────────────────▶│ exec          │
+   │                                     init-1 exits 0  ◀────│ event seq=12  │
+   ✖ crash E: agent never saw seq=12. On reconnect supervisor replays seq≥12  │
+   │          → agent records init-1 Completed, starts init-2. An init        │
+   │          container is **never re-run after it recorded success**, even  │
+   │          if the agent crashed before persisting it (the supervisor's    │
+   │          record is authoritative for exits).                            │
+   │ sidecar start ─────────────────────────────────────────▶│               │
+   ✖ crash E2: sidecar keeps running under the supervisor. Startup probe      │
+   │           state is lost (in-memory) → re-probed; init-2 starts only once │
+   │           the sidecar's startup probe passes again (idempotent gate).    │
+   │                                                                          │
+   │ main start; Running ──────────────────────────────────────────────────▶│
+   ✖ crash F: containers keep running (supervisor). Probes pause for the      │
+   │          duration of the outage (no liveness kills while blind);         │
+   │          readiness is **kept at its last value** until the first probe   │
+   │          result after restart (not flipped to false → no endpoint churn  │
+   │          on every agent upgrade). Exits during the outage are replayed;  │
+   │          restart decisions happen on reconnect with backoff computed     │
+   │          from the recorded exit timestamps.                              │
+   │                                                                          │
+   │ delete requested; PodRecord{Terminating, started_at(wall), boot_id,      │
+   │                             drain_started_at, grace=30s}                 │
+   │ drain gate: wait for dataplanes' observed generation …                   │
+   ✖ crash G: resume drain gate with remaining = drainTimeout − elapsed       │
+   │          (elapsed from persisted wall time; same boot_id required).      │
+   │ preStop → SIGTERM ─────────────────────────────────────▶│               │
+   ✖ crash G2: SIGTERM already sent (intent+done recorded) → don't re-run      │
+   │           preStop; wait remaining grace = 30 s − elapsed; then           │
+   │           cgroup.kill. If only intent was recorded → re-send SIGTERM     │
+   │           (idempotent for any well-behaved process).                     │
+   │                                                                          │
+   │ Cleaning: unmount, release IP (→ quarantine{until}), remove BPF entry,   │
+   │           remove netns, kill supervisor, rmdir cgroup                    │
+   ✖ crash H: each cleanup step is idempotent ("already gone" = success). The │
+   │          IP quarantine deadline is persisted, so a restart doesn't       │
+   │          release the IP early.                                           │
+   │ PodRecord{Terminated, final_status, reported=false}                      │
+   │ final status ─────────────────────────────────────────────────────────▶│
+   ✖ crash I: reported=false → re-send final status on restart (status writes │
+   │          are idempotent applies). The API object is only deleted after   │
+   │          this report, so the pod can't vanish with an unknown exit code. │
+   │ ack ◀──────────────────────────────────────────────────────────────────│
+   │ delete PodRecord                                                         │
+```
+
+#### Summary table
+
+| Crash point | Durable state | Running state | Recovery action | Must never happen |
+|---|---|---|---|---|
+| A – before admit | none | none | Re-admit from watch | — |
+| B – admitted | `Admitted` | none | Start prepare | Admit a second copy (UID-keyed) |
+| C – preparing | intents, partial allocations | partial mounts, ingest files | Re-run each unfinished step idempotently | Double mount; new IP for same UID |
+| D – sandbox | `intent{sandbox}` | supervisor maybe | Adopt via socket, or tear down + redo | Two supervisors for one UID |
+| E – init/sidecar | init progress up to last ack | init/sidecar processes | Replay supervisor events; re-gate on startup probe | Re-run a completed init container |
+| F – running | `Running`, restart counts | all containers | Reconnect, resume probes, replay exits | Liveness kill based on stale probe state; readiness flap |
+| G – terminating | start time, boot ID, phase of termination | containers in grace | Continue with *remaining* grace | Grace restarting from zero (pod outlives its budget) |
+| H – cleaning | quarantine deadlines | leftovers | Idempotent cleanup | Early IP reuse |
+| I – terminated, unreported | final status, `reported=false` | nothing | Resend status | Pod object deleted without final status |
+| Reboot (boot ID changed) | all records | nothing | Every pod is dead: report `Failed{NodeRebooted}` for `Never` pods, re-create sandboxes for others (pods are *restarted*, not resumed); free all allocations except quarantine | Resuming a "Running" record whose processes no longer exist |
+
+#### Testing it
+
+Each `✖` above is a named **crash point** (`crashpoint!("sandbox.after_spawn")`)
+compiled in under a `crash-points` cargo feature. The integration suite iterates over
+every registered point: run the pod lifecycle, `abort()` the agent at that point, restart
+it, and assert the invariants in the last column plus "the final API state equals the
+no-crash run". This is cheap to run in CI (`cargo xtask crash-matrix`) and turns
+"every stage is resumable" from a claim into a test (pain point `PP-5G`).
+
 ## Open questions
 
 - Container start ordering among main containers – include or not?

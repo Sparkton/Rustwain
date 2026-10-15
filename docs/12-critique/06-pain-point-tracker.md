@@ -46,6 +46,8 @@ design docs, issues and commits (`PP-53`).
 | PP-22 | Separate etcd operations (TLS, backups, upgrades) | H | Embedded store; built-in scheduled backups | Store bugs are our bugs (sim testing needed) | [backup](../10-cluster-operations/07-backup-and-disaster-recovery.md) | designed |
 | PP-23 | Heartbeat/event write churn | M | Leader-local leases; separate lossy event store | Events not durable | [registration](../04-node-agent/05-node-registration-and-heartbeat.md), [events](../10-cluster-operations/10-audit-and-events.md) | designed |
 | PP-24 | Restore resets revisions, confusing caches | L | Revision bump on restore | — | [backup](../10-cluster-operations/07-backup-and-disaster-recovery.md) | designed |
+| PP-25 | Leader elections from fsync latency spikes (noisy/shared disks; "etcdserver: request timed out") | H | PreVote + check-quorum; group commit; leader fsync in parallel with replication; never retry fsync after EIO (step down) | Needs a dedicated log disk for best results | [state store](../07-control-plane/02-state-store.md) | designed |
+| PP-26 | Stale or ambiguous reads (resourceVersion="0" served from a lagging watch cache; ambiguous write outcome on leader loss) | M | ReadIndex-gated reads from the in-memory store; explicit read levels; idempotency keys on proposals | Dedup table in the state machine | [state store](../07-control-plane/02-state-store.md) | designed |
 
 ## Scheduler
 
@@ -87,6 +89,8 @@ design docs, issues and commits (`PP-53`).
 | PP-5C | `kubectl cp` needs tar in image | L | Native file API | — | [logs/exec](../04-node-agent/06-logs-exec-attach-port-forward.md) | designed |
 | PP-5D | Disk accounting via du scans | M | Project quotas | Needs fs support | [filesystems](../01-linux-foundations/04-filesystems.md) | designed |
 | PP-5E | OOMKilled misreported for child processes | L | memory.events oom_kill counter | — | [supervision](../01-linux-foundations/06-process-supervision.md) | designed |
+| PP-5F | Node-pressure eviction ignores PodDisruptionBudgets and can over-evict (several pods for one pressure event) | M | One eviction in flight per resource at `Evict` level; prefer pods with budget headroom in ranking; zero-grace only at `Emergency` | Slower relief at moderate pressure | [eviction](../04-node-agent/04-resources-qos-eviction.md) | designed |
+| PP-5G | kubelet crash/restart leaves orphaned state ("orphaned pod found, but volume paths are still present on disk", leaked cgroups/netns) | M | Intent-before-effect checkpoint, UID-named host artifacts, orphan GC before admitting new pods, crash-point test matrix | Every step must be idempotent | [pod lifecycle](../04-node-agent/02-pod-lifecycle.md) | designed |
 
 ## Networking
 
@@ -104,6 +108,8 @@ design docs, issues and commits (`PP-53`).
 | PP-69 | NetworkManager/firewalld/networkd interference | M | Doctor checks + drop-ins | — | [host variance](../01-linux-foundations/05-linux-host-variance.md) | designed |
 | PP-6A | Fixed per-node pod CIDR | M | Dynamic blocks; IPv6 /64 | More routes | [IPAM](../05-networking/08-ipam-and-dual-stack.md) | designed |
 | PP-6B | Encryption requires add-ons | M | Built-in WireGuard | — | [encryption](../05-networking/09-encryption-and-multicluster.md) | designed |
+| PP-6C | Client source IP lost on NodePort/LB (`externalTrafficPolicy: Cluster`), or uneven load with `Local` | M | DSR with Geneve option + Maglev, per-node capability probe and SNAT fallback | Needs cloud anti-spoofing disabled (PP-R2) | [dataplane](../05-networking/03-ebpf-dataplane.md) | designed |
+| PP-6D | Pod IP leaks after runtime/kubelet crashes ("no IP addresses available in range") | M | UID-keyed allocations in the same txn as the intent; leak repair on agent start; quarantine | — | [IPAM](../05-networking/08-ipam-and-dual-stack.md) | designed |
 
 ## Workloads
 
@@ -134,6 +140,7 @@ design docs, issues and commits (`PP-53`).
 | PP-85 | No built-in image verification | M | ImagePolicy with Sigstore | Registry access at admission | [supply chain](../09-security/04-supply-chain.md) | designed |
 | PP-86 | Image pulled with creds reusable by other pods | M | Credential-aware image access checks | Extra registry HEAD | [images](../02-container-runtime/03-images-and-snapshotters.md) | designed |
 | PP-87 | Long-lived SA tokens auto-mounted (legacy) | H | No auto-mount; bound short-lived only | — | [PKI](../09-security/01-identity-and-pki.md) | designed |
+| PP-88 | Distro userns restrictions (Ubuntu 24.04+ AppArmor) break rootless/userns workloads with opaque EPERM | M | Empirical userns probes (root and unprivileged), doctor remediation, shipped AppArmor profile for rootless mode | One more distro-specific artifact to maintain | [kernel feature matrix](../01-linux-foundations/07-kernel-feature-matrix.md) | designed |
 
 ## Storage
 
@@ -157,6 +164,19 @@ design docs, issues and commits (`PP-53`).
 | PP-94 | Events lossy & in etcd | M | Separate event store, explicitly lossy | Still lossy (by design) | [events](../10-cluster-operations/10-audit-and-events.md) | designed |
 | PP-95 | Dead cloud nodes linger NotReady | L | NodeLifecycle plugin deletes | — | [cloud](../10-cluster-operations/09-cloud-provider-integration.md) | designed |
 | PP-96 | Control-plane overload → false node deaths → reschedule storms | H | Leader-local leases; overload-aware node lifecycle; zone rate limits | — | [fairness](../07-control-plane/09-api-fairness.md) | designed |
+
+## Rustwain-specific trade-offs (PP-R)
+
+New pain that our own designs introduce. Kept here so the cost of each decision stays
+visible next to the problem it solves.
+
+| ID | Pain point | Sev | Mitigation | Caused by | Doc | Status |
+|---|---|---|---|---|---|---|
+| PP-R1 | PSI is compiled in but disabled by default on Debian and RHEL kernels; PSI-driven eviction needs a `psi=1` boot argument | M | `degraded` mode with 1 s usage polling; doctor prints the exact grub/grubby fix | PSI-first eviction (PP-53) | [kernel feature matrix](../01-linux-foundations/07-kernel-feature-matrix.md) | designed |
+| PP-R2 | DSR replies leave a node with another node's source IP; cloud anti-spoofing and strict uRPF drop them | M | Per-node `dsr-capable` probe at join; automatic SNAT fallback per node | DSR (PP-6C) | [dataplane](../05-networking/03-ebpf-dataplane.md) | designed |
+| PP-R3 | Leader-local leases stretch dead-node detection to ~2× lease duration after an unplanned leader failover | L | Lease-table handover on planned transfer; `[open]` replicated suspect list | Non-durable heartbeats (PP-23) | [state store](../07-control-plane/02-state-store.md) | designed |
+| PP-R4 | MicroVM pods need per-packet NAT and conntrack (guest kernel bypasses socket LB) | M | Separate preallocated `ct` map for TAP endpoints; `CtFull` drops new flows, never established ones | MicroVM isolation class | [dataplane](../05-networking/03-ebpf-dataplane.md) | designed |
+| PP-R5 | First use of a new affinity/spread selector costs an O(pods) backfill in the scheduler | L | Selector registry with refcounts; backfill off the scheduling hot path | Domain counters (PP-31) | [scheduler](../07-control-plane/06-scheduler.md) | designed |
 
 ## Things we deliberately won't fix (or not yet)
 

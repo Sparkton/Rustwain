@@ -110,6 +110,190 @@ the host stack.
 - Pods using **raw sockets / non-connect UDP patterns** – sendmsg hooks cover UDP; raw is
   rare.
 
+## Packet walk: external client → NodePort with DSR
+
+Setup: Service `web`, `type: NodePort`, port 30443/TCP → targetPort 8443,
+`externalPolicy: Cluster`, `algorithm: Maglev`, `dsr: true`. Client C (198.51.100.7)
+outside the cluster. Node N1 (10.0.0.1) receives the packet; the selected backend B
+(fd00:10:42:2::17 / 10.42.2.17) runs on node N2 (10.0.0.2). Native routing underlay,
+IPv4 shown for readability. DSR encapsulation: **Geneve with a Rustwain option**
+carrying the original frontend `{N1_IP, 30443}` (the alternative IPv4 IP-option /
+IPv6 destination-option encodings are listed below).
+
+```
+ C (198.51.100.7)          N1 phys NIC (XDP)            N2 phys NIC (TC ingress)   B (pod on N2)    N2 netkit (pod egress)
+   │                              │                              │                     │                   │
+   │ SYN 198.51.100.7:51000       │                              │                     │                   │
+   │  → 10.0.0.1:30443            │                              │                     │                   │
+   │─────────────────────────────▶│                              │                     │                   │
+   │                              │ 1 parse eth/ip/tcp           │                     │                   │
+   │                              │ 2 services[{10.0.0.1,30443,  │                     │                   │
+   │                              │    TCP, external}] hit       │                     │                   │
+   │                              │ 3 flows LRU miss (SYN)       │                     │                   │
+   │                              │   → maglev[svc][hash5 % M]   │                     │                   │
+   │                              │   → backend B@N2             │                     │                   │
+   │                              │   flows[5-tuple] := B        │                     │                   │
+   │                              │ 4 DNAT inner dst → B:8443    │                     │                   │
+   │                              │   MSS clamp SYN option to    │                     │                   │
+   │                              │   underlay_mtu − 40 − 58     │                     │                   │
+   │                              │ 5 push outer IP/UDP/Geneve   │                     │                   │
+   │                              │   (+opt {10.0.0.1,30443})    │                     │                   │
+   │                              │   outer 10.0.0.1 → 10.0.0.2  │                     │                   │
+   │                              │ 6 XDP_TX (same NIC) or       │                     │                   │
+   │                              │   XDP_REDIRECT (other NIC)   │                     │                   │
+   │                              │─────────────────────────────▶│                     │                   │
+   │                              │                              │ 7 decap; read opt   │                     │
+   │                              │                              │ 8 ct_dsr[{C:51000,  │                     │
+   │                              │                              │    B:8443,TCP}] :=  │                     │
+   │                              │                              │    {10.0.0.1,30443} │                     │
+   │                              │                              │ 9 ingress policy B: │                     │
+   │                              │                              │   src = world       │                     │
+   │                              │                              │   identity, 8443 ✔  │                     │
+   │                              │                              │10 redirect_peer(B)─▶│                     │
+   │                              │                              │                     │ SYN-ACK           │
+   │                              │                              │                     │ B:8443 → C:51000  │
+   │                              │                              │                     │──────────────────▶│
+   │                              │                              │                     │                   │11 ct_dsr hit →
+   │                              │                              │                     │                   │   SNAT src to
+   │                              │                              │                     │                   │   10.0.0.1:30443
+   │                              │                              │                     │                   │12 FIB lookup →
+   │                              │                              │                     │                   │   redirect_neigh
+   │◀────────────────────────────────────────── SYN-ACK 10.0.0.1:30443 → 198.51.100.7:51000 ───────────────│   (out N2 phys,
+   │                              │                              │                     │                   │    not via N1)
+   │ ACK / data → 10.0.0.1:30443  │                              │                     │                   │
+   │─────────────────────────────▶│ flows LRU hit → B; encap,    │                     │                   │
+   │                              │ (no option needed after SYN  │                     │                   │
+   │                              │  – N2 already has ct_dsr)    │                     │                   │
+```
+
+Step notes:
+
+- **Step 1.** **XDP runs before skb allocation**, so a NodePort hit that leaves the node again
+   (remote backend) never builds an skb on N1. Non-matching packets return `XDP_PASS`
+   with a single hash lookup of overhead.
+- **Step 2.** **Frontend key includes scope**: `external` frontends match only on the physical
+   NIC hook; the same port on a pod-facing hook is not a NodePort. NodePort frontends are
+   programmed for every node IP (and optionally only for specific interfaces –
+   `nodePortAddresses`).
+- **Step 3.** **Backend choice must be stable across packets and across nodes.** Maglev on the
+   5-tuple gives every node the same answer for the same flow, so ECMP re-hashing an
+   established flow to N3 still lands on B. The small `flows` LRU on N1 pins flows
+   through backend-set changes (Maglev's minimal disruption is not zero disruption).
+   Without it, scaling `web` from 10 to 11 replicas would reset ~1/11 of established
+   external connections.
+- **Step 4.** **MSS clamping is mandatory with encapsulated DSR.** C's SYN advertises an MSS
+   derived from its own 1500-byte MTU; inner packets of that size plus outer
+   IP/UDP/Geneve(+option) headers (~58 bytes) exceed the underlay MTU. PMTU discovery
+   can't fix it – ICMP "frag needed" from the underlay would go to N1's outer source,
+   not to C. Rewriting MSS in the SYN (and updating the TCP checksum with
+   `bpf_l4_csum_replace`) is the only reliable fix. UDP NodePorts with DSR therefore
+   require headroom or fall back to SNAT mode (configurable per service).
+- **Step 5.** **Encapsulation choice:**
+
+   | Encoding | Overhead | Works through | Notes |
+   |---|---|---|---|
+   | Geneve + option (default) | ~58 B | Anything that carries UDP | Reuses the overlay device; option also carries src identity |
+   | IPv4 IP option | 8 B | Routers that don't drop/slow-path IP options – many do | Cilium supports; often punted to CPU by hardware routers |
+   | IPv6 destination option ext. header | 8 B | IPv6 underlays that pass ext. headers | Cleanest on v6-only underlays |
+
+- **Step 8.** **N2 keeps reverse-NAT state, N1 keeps none for the reply path.** `ct_dsr` is an LRU
+   keyed by the backend-side tuple; entries are refreshed by inbound packets and expire
+   on FIN/RST + timeout. Its size bounds the number of concurrent DSR flows per node
+   (default 256k entries ≈ 30 MiB); LRU eviction of a live entry makes the next reply
+   leave unrewritten (sourced from B's pod IP, which C never matches to its connection, so the flow stalls until C times out) – an `events` ring-buffer
+   drop reason `DsrStateEvicted` makes this visible.
+- **Step 11.** **The reply leaves N2 with source 10.0.0.1** – an address that isn't N2's. This is
+  the whole point of DSR and also its main deployment constraint: **cloud anti-spoofing
+   must be off** (AWS ENI source/dest check, GCP `canIpForward`, Azure IP forwarding)
+   and upstream routers must not run strict uRPF on this path. The agent probes this at
+   join time by sending a crafted packet to a peer node with a foreign source and
+   reports `node.rustwain.io/dsr-capable` as an attribute; services with `dsr: true`
+   fall back to SNAT on nodes without it. Tracked as `PP-R2`.
+
+**Local-backend shortcut:** if the Maglev pick is on N1 itself, step 5–6 become DNAT +
+`bpf_redirect_peer` into the pod, and the reply's reverse NAT happens in N1's netkit
+program – no encapsulation, same `ct_dsr` map.
+
+**Health and `Local` policy:** with `externalPolicy: Local`, N1's backend table only
+contains local endpoints, DSR is unnecessary and step 5 never happens. With `Cluster` +
+DSR the client IP is preserved *and* load is spread – the combination Kubernetes can only
+reach with Cilium-specific configuration (`PP-6C`).
+
+## Packet walk: microVM pod → Service
+
+Setup: pod A runs in a microVM (`isolation: microvm`, see
+[KVM and microVMs](../03-virtualization/02-kvm-and-microvms.md)) on N1. The VMM
+(cloud-hypervisor class) exposes a virtio-net device backed by a host TAP `rwt3f9a`
+with vhost-net. The guest kernel has its own TCP stack, so **cgroup socket hooks never
+see A's `connect()`** – service translation happens per packet on the TAP. A connects to
+Service `api` VIP fd00:10:96::a:443 → backend B (pod on N2, fd00:10:42:2::21:8443).
+
+```
+ guest app     guest kernel      vhost-net / TAP      N1 TC ingress on rwt3f9a      N1 egress          N2 → B
+   │                │            (host side)                  │                     │                 │
+   │ connect(VIP)   │                 │                       │                     │                 │
+   │───────────────▶│ ND for gateway  │                       │                     │                 │
+   │                │ fe80::1 ───────▶│──────────────────────▶│ 0 NDP/ARP responder │                 │
+   │                │◀───────────────────────────── NA (gw MAC) ◀ in BPF (no host   │                 │
+   │                │                 │                       │   neighbour entry)  │                 │
+   │                │ SYN A→VIP:443   │                       │                     │                 │
+   │                │ (GSO/csum       │                       │                     │                 │
+   │                │  partial ok)    │                       │                     │                 │
+   │                │────────────────▶│ vhost kthread writes  │                     │                 │
+   │                │                 │ skb → rwt3f9a rx ────▶│ 1 anti-spoof: src   │                 │
+   │                │                 │                       │   MAC/IP == A's     │                 │
+   │                │                 │                       │   allocation, else  │                 │
+   │                │                 │                       │   drop SpoofedSrc   │                 │
+   │                │                 │                       │ 2 services[VIP:443] │                 │
+   │                │                 │                       │ 3 ct[A:p→VIP:443]   │                 │
+   │                │                 │                       │   miss (SYN): pick  │                 │
+   │                │                 │                       │   backend B, insert │                 │
+   │                │                 │                       │   ct{→B, rev_nat}   │                 │
+   │                │                 │                       │ 4 DNAT dst → B:8443 │                 │
+   │                │                 │                       │   (l3/l4 csum diff; │                 │
+   │                │                 │                       │   partial csum safe)│                 │
+   │                │                 │                       │ 5 egress policy for │                 │
+   │                │                 │                       │   A's identity      │                 │
+   │                │                 │                       │ 6 ipcache[B] → N2   │                 │
+   │                │                 │                       │   encap/route,      │                 │
+   │                │                 │                       │   bpf_check_mtu     │                 │
+   │                │                 │                       │   (GSO-aware) ─────▶│ redirect_neigh  │
+   │                │                 │                       │                     │ / tunnel ──────▶│ (normal pod
+   │                │                 │                       │                     │                 │  ingress walk)
+   │                │                 │                       │                     │                 │
+   │                │                 │      reply B:8443 → A:p arrives on N1 (tunnel/phys TC ingress)│
+   │                │                 │                       │ 7 endpoints[A] →    │                 │
+   │                │                 │                       │   ifindex rwt3f9a,  │                 │
+   │                │                 │                       │   kind=Tap          │                 │
+   │                │                 │                       │ 8 ct hit → reverse  │                 │
+   │                │                 │                       │   NAT src B:8443 →  │                 │
+   │                │                 │                       │   VIP:443           │                 │
+   │                │                 │                       │ 9 bpf_redirect(     │                 │
+   │                │                 │◀──────────────────────│   rwt3f9a, egress)  │                 │
+   │                │◀────────────────│ vhost → guest rx ring │   (not _peer: TAP   │                 │
+   │◀───────────────│ SYN-ACK from VIP│                       │   has no peer netns)│                 │
+```
+
+What differs from the container walk, and why:
+
+| Concern | Container pod | MicroVM pod |
+|---|---|---|
+| Service translation | Socket LB at `connect()`, no per-packet NAT | **Per-packet DNAT + `ct` entry** on TAP ingress, reverse NAT on delivery |
+| Conntrack state | None for east-west services | One `ct` entry per flow – size the map for VM density (`PP-R4`) |
+| Gateway resolution | netkit is L3 (no ARP/ND needed) | Guest does ARP/ND; BPF answers for the gateway address so no host neighbour/proxy-ARP sysctls are needed |
+| Source trust | Container shares host kernel; spoofing needs `CAP_NET_RAW` (dropped by default) | Guest is root in its own kernel – **assume every packet can be forged**; enforce MAC+IP per TAP |
+| Delivery into the pod | `bpf_redirect_peer` (netns switch, no backlog queue) | `bpf_redirect` to TAP egress → vhost-net queue |
+| Offloads | Kernel stack handles | Guest TSO produces up to 64 KiB GSO skbs; checksum may be `CHECKSUM_PARTIAL`. NAT must use incremental csum helpers; MTU checks must be GSO-aware (`bpf_check_mtu` with `BPF_MTU_CHK_SEGS`) |
+| DNS | Socket LB on UDP sendmsg to the node-local resolver | Guest resolv.conf points to the node-local resolver IP directly (no VIP), so DNS skips `ct` entirely |
+| Policy identity | From netkit ifindex → endpoint | From TAP ifindex → endpoint (same `endpoints` map, `kind=Tap`) |
+
+Failure note: `ct` entries for microVM flows are on the **critical path of correctness**
+(losing one mid-flow sends replies with the backend's address, which the guest drops).
+The `ct` map for TAP endpoints is therefore a separate, preallocated hash (not an LRU
+shared with best-effort maps): when full, *new* flows are dropped with reason `CtFull`
+(the guest retries the SYN) instead of silently breaking established ones, and a
+non-zero `CtFull` counter is surfaced as a node condition.
+
 ## Masquerade / egress SNAT
 Traffic from pods to outside the cluster CIDRs → SNAT to node IP. BPF-based NAT with
 port allocation (`nat` map) instead of iptables MASQUERADE; avoids conntrack table

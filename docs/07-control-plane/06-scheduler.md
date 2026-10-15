@@ -35,6 +35,120 @@ preferences are optimised, fast, at scale, without double-booking.
   generation (copy-on-write structures) so filtering can run in parallel threads without
   locks.
 
+### API sketch: snapshot and domain counters
+
+```rust
+/// Interned identifiers keep the hot maps small and hashing cheap.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct NodeId(u32);
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+pub struct TopologyKey(u16);          // "node", "zone", "rack", or any attribute key
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+pub struct DomainValue(u32);          // interned value: "eu-west-1a"
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+pub struct SelectorId(u32);           // interned, canonicalised label selector
+
+/// One immutable generation of cluster state. Cheap to clone (persistent structures).
+#[derive(Clone)]
+pub struct Snapshot {
+    pub generation: u64,
+    pub nodes: im::OrdMap<NodeId, Arc<NodeInfo>>,
+    pub domains: DomainIndex,          // node → domain per topology key, and inverse
+    pub counters: DomainCounters,      // label-selector counts per domain
+    pub anti: AntiAffinityIndex,       // existing pods' anti-affinity terms (symmetry)
+    pub classes: EquivalenceCache,     // filter results per (class, node generation)
+}
+
+pub struct NodeInfo {
+    pub id: NodeId,
+    pub generation: u64,               // bumped on any change to this node's view
+    pub allocatable: Resources,
+    pub requested: Resources,          // bound + assumed pods
+    pub attributes: AttributeSet,
+    pub taints: SmallVec<[Taint; 4]>,
+    pub numa: Vec<NumaFree>,           // free exclusive CPUs / hugepages / devices per NUMA node
+    pub pods: im::HashSet<PodKey>,
+}
+
+pub struct DomainIndex {
+    node_domain: HashMap<(NodeId, TopologyKey), DomainValue>,
+    domain_nodes: HashMap<(TopologyKey, DomainValue), im::OrdSet<NodeId>>,
+    /// Domains eligible for spread counting (nodes the pod could tolerate are decided
+    /// per pod at PreFilter; this is the full list).
+    domains_of: HashMap<TopologyKey, im::OrdSet<DomainValue>>,
+}
+
+/// Counters exist only for selectors that some pending pod or some existing pod's
+/// affinity term actually uses — never for every label combination.
+pub struct DomainCounters {
+    registry: SelectorRegistry,        // SelectorId → (Selector, refcount)
+    counts: im::HashMap<(SelectorId, TopologyKey), im::HashMap<DomainValue, u32>>,
+    epochs: im::HashMap<SelectorId, u64>, // bumped on any count change; equivalence-cache key
+}
+
+impl DomainCounters {
+    /// O(1). Used by Filter/Score for affinity, anti-affinity and spread.
+    pub fn count(&self, sel: SelectorId, key: TopologyKey, dom: DomainValue) -> u32;
+    /// O(domains of key). Used by TopologySpread to compute global min for max-skew.
+    pub fn min_over(&self, sel: SelectorId, key: TopologyKey,
+                    eligible: &im::OrdSet<DomainValue>) -> u32;
+    /// Called by the snapshot builder for every bound/assumed/removed pod.
+    /// Cost: O(registered selectors that match the pod's labels × topology keys in use).
+    pub fn on_pod(&mut self, pod: &PodLabels, node: NodeId, d: &DomainIndex, delta: i32);
+}
+
+pub struct SelectorRegistry { /* … */ }
+impl SelectorRegistry {
+    /// First registration of a selector backfills counts with one O(pods) scan;
+    /// later registrations bump the refcount. Unregister at refcount 0 frees the counters.
+    pub fn register(&mut self, sel: &Selector, key: TopologyKey) -> SelectorId;
+    pub fn release(&mut self, id: SelectorId);
+    /// Labels → matching registered selectors, via an inverted index on
+    /// (label key, value) so matching a pod is not O(registered selectors).
+    pub fn matching(&self, labels: &PodLabels) -> SmallVec<[SelectorId; 8]>;
+}
+
+/// Symmetric anti-affinity: "existing pod P says: no pod matching S in P's zone".
+/// Indexed by domain so an incoming pod checks only the terms of its candidate domain.
+pub struct AntiAffinityIndex {
+    terms: im::HashMap<(TopologyKey, DomainValue), im::HashMap<SelectorId, u32>>,
+}
+
+/// Single writer, many readers. Scheduling cycles grab an Arc<Snapshot> and never
+/// observe a half-applied update.
+pub struct SnapshotBuilder {
+    next: Snapshot,
+    published: Arc<arc_swap::ArcSwap<Snapshot>>,
+}
+impl SnapshotBuilder {
+    pub fn apply(&mut self, ev: ClusterEvent);      // from watches: node/pod add/update/delete
+    pub fn assume(&mut self, pod: &PodInfo, node: NodeId, alloc: &Allocation);
+    pub fn forget(&mut self, pod: &PodKey);         // bind failed → undo assume
+    pub fn publish(&mut self) -> u64;               // swap in a new generation; returns it
+}
+```
+
+How a pod with `antiAffinity: {selector: app=db, topology: node}` and
+`spread: {topology: zone, maxSkew: 1}` is evaluated against a node:
+
+```
+PreFilter (once per pod):
+  s_aff  = registry.register({app=db}, node)       // usually already registered
+  s_sprd = registry.register(owner-selector, zone)
+  eligible_zones = zones with ≥1 node the pod tolerates (nodeTaintsPolicy: Honor)
+  zmin = counters.min_over(s_sprd, zone, eligible_zones)       // O(zones)
+Filter (per node n, in parallel):
+  counters.count(s_aff, node, dom(n, node)) == 0             // O(1)
+  counters.count(s_sprd, zone, dom(n, zone)) + 1 - zmin <= 1  // O(1)
+  anti.terms[(k, dom(n, k))] has no selector matching the pod's labels, for each k in use
+                                                              // O(terms in that domain)
+```
+
+Equivalence-cache key for filter results: `(class_id, node.generation,
+counters_epoch(selectors the class uses))`. Any counter change for a selector the class
+depends on bumps that selector's epoch, invalidating exactly the dependent cache lines –
+the invalidation precision Kubernetes' removed equivalence cache lacked.
+
 ### Pipeline (framework, Rust traits)
 ```rust
 pub trait Plugin: Send + Sync {

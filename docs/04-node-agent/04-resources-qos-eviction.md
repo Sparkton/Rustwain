@@ -164,6 +164,101 @@ must evict pods before the kernel OOM killer or a full disk causes chaos.
    owner replaces them; the node gets a `MemoryPressure`/`DiskPressure` condition +
    taint so the scheduler stops placing BestEffort/Burstable pods there.
 
+### API sketch: the eviction manager
+
+```rust
+/// Event sources. PSI triggers are pollable fds; disk and PID signals are cheap reads.
+pub enum Signal {
+    MemoryPressure { scope: CgroupScope, some_avg10: f32, full_avg10: f32 },
+    MemoryAvailable { anon_unreclaimable: Bytes, allocatable: Bytes },
+    DiskUsage { fs: FsId, used: Bytes, capacity: Bytes, inodes_free: u64 },
+    PidHeadroom { used: u64, max: u64 },
+}
+
+#[async_trait]
+pub trait SignalSource: Send {
+    /// Resolves when a registered trigger fires or the periodic fallback tick elapses
+    /// (1 s, only used when PSI triggers are unavailable – see the kernel feature matrix).
+    async fn next(&mut self) -> Signal;
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
+pub enum Level { Normal = 0, Reclaim = 1, Throttle = 2, Evict = 3, Emergency = 4 }
+
+pub struct Thresholds {
+    /// Enter level L when the expression holds for `sustain`; leave it only when the
+    /// *exit* expression holds for `cooldown` (hysteresis; prevents flapping).
+    pub memory: [LevelRule; 4],
+    pub disk: [LevelRule; 2],         // Evict, Emergency
+    pub pids: [LevelRule; 1],         // Evict
+}
+
+pub struct LevelRule { pub enter: Expr, pub exit: Expr, pub sustain: Duration, pub cooldown: Duration }
+
+/// Ranking: derive(Ord) on field order — first field dominates.
+#[derive(Eq, PartialEq, Ord, PartialOrd)]
+pub struct VictimKey {
+    pub critical: bool,               // node-critical pods sort last (false < true)
+    pub qos: QosRank,                 // BestEffort < Burstable < Guaranteed
+    pub priority: i32,                // lower priority evicted first
+    pub disruption_blocked: bool,     // [proposed] pods whose owner has budget headroom (false) first
+    pub over_request: Reverse<i64>,   // larger usage-above-request first
+    pub started_at: Reverse<WallTime>,// tie-break: youngest first (least work lost)
+}
+
+/// Side effects, behind a trait so the policy is unit-testable with a fake.
+pub trait Actuator {
+    fn reclaim(&mut self, pod: PodUid, bytes: Bytes) -> io::Result<()>;   // memory.reclaim
+    fn throttle(&mut self, pod: PodUid, memory_high: Bytes) -> io::Result<()>;
+    fn unthrottle(&mut self, pod: PodUid) -> io::Result<()>;
+    /// `grace == ZERO` → cgroup.kill immediately (Emergency).
+    fn evict(&mut self, pod: PodUid, reason: EvictionReason, grace: Duration);
+}
+
+pub struct EvictionManager<S: SignalSource, A: Actuator> {
+    signals: S,
+    actuator: A,
+    thresholds: Thresholds,
+    level: LevelState,                // current level per resource + entered_at
+    in_flight: HashMap<PodUid, Instant>,  // evictions not yet finished terminating
+    pods: Arc<PodUsageView>,          // per-pod usage from cgroup files, refreshed on signal
+}
+
+impl<S: SignalSource, A: Actuator> EvictionManager<S, A> {
+    pub async fn run(mut self, clock: impl Clock) -> ! {
+        loop {
+            let sig = self.signals.next().await;
+            let target = self.level.evaluate(&self.thresholds, &sig, clock.now());
+            match target {
+                Level::Normal   => self.relax(),
+                Level::Reclaim  => self.reclaim_cold_cache(),
+                Level::Throttle => self.throttle_best_effort(),
+                Level::Evict    => {
+                    // At most one new eviction per resource until the previous one has
+                    // released its memory (or 10 s passed) — avoids evicting 5 pods for
+                    // a problem one eviction solves, the over-eviction failure mode.
+                    if self.in_flight.is_empty() { self.evict_one(Grace::PodSpec) }
+                }
+                Level::Emergency => self.evict_one(Grace::Zero), // no in-flight gate
+            }
+        }
+    }
+}
+```
+
+Design points the sketch encodes:
+- **Time is injected** (`Clock`) so level transitions, sustain/cooldown and in-flight
+  gates are tested with a simulated clock – no sleeping tests.
+- **One eviction in flight** at `Evict` level: kubelet can evict several pods in quick
+  succession because a terminating pod still holds its memory during its grace period.
+  `Emergency` bypasses the gate and uses zero grace, because by then the kernel OOM
+  killer is the alternative.
+- **`disruption_blocked` in the ranking** `[proposed]`: node-pressure eviction can't *wait* for
+  disruption budgets (Kubernetes ignores PDBs here entirely), but among otherwise equal
+  candidates it can prefer pods whose owner currently has budget headroom (`PP-5F`).
+- `PodUsageView` reads `memory.stat` (anon, file, unevictable), `memory.current` and the
+  pod's project-quota usage only when a signal fires – no background scraping.
+
 ### Userspace OOM killer?
 systemd-oomd and Meta's oomd kill based on PSI before the kernel OOM. Our eviction
 manager *is* a PSI-based userspace OOM preventer scoped to pods. Ensure systemd-oomd

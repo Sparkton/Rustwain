@@ -46,6 +46,7 @@ depends on decisions made below it.
 | [04-filesystems](01-linux-foundations/04-filesystems.md) | overlayfs, idmapped mounts, mount propagation, pivot_root |
 | [05-linux-host-variance](01-linux-foundations/05-linux-host-variance.md) | Distros, kernels, init systems, arches – running on *different* Linux machines |
 | [06-process-supervision](01-linux-foundations/06-process-supervision.md) | pidfd, subreapers, signals, zombies, the init problem |
+| [07-kernel-feature-matrix](01-linux-foundations/07-kernel-feature-matrix.md) | Per-distro defaults (kernel, cgroups, LSM, BTF, PSI, userns, firewall, network manager) and the exact probe for each |
 
 ### 02 – Container runtime
 | Doc | Covers |

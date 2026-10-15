@@ -42,6 +42,121 @@ Key techniques:
   resume point (avoids `TooOld` on resume after quiet periods).
 - **Progress notifications**: allow consistent reads to confirm cache freshness.
 
+### API sketch: hub dispatch
+
+```rust
+pub struct WatcherId(u64);
+
+/// One applied change, as produced by the state machine's apply loop.
+pub struct Change {
+    pub rev: Revision,
+    pub kind: KindId,
+    pub key: Key,
+    pub prev: Option<Arc<StoredObject>>,   // None on create
+    pub next: Option<Arc<StoredObject>>,   // None on delete
+}
+
+/// What a watcher asked for, compiled once at registration.
+pub struct WatchFilter {
+    pub kind: KindId,
+    pub namespace: Option<NamespaceId>,
+    /// At most one *routing* term – the most selective indexed predicate
+    /// (a field index like spec.node, or one label equality). Used for dispatch.
+    pub route: Route,
+    /// Remaining predicates (other labels, set-based selectors), evaluated only on
+    /// watchers the route already selected.
+    pub residual: Option<CompiledSelector>,
+    pub projection: Option<ProjectionId>,   // [proposed] field projection
+    pub format: WireFormat,                 // Binary | Json
+}
+
+pub enum Route {
+    Index { index: IndexId, value: IndexValue },  // spec.node=node-7, label app=web
+    Namespace,                                     // all of `namespace`
+    Kind,                                          // cluster-wide catch-all
+}
+
+/// Dispatch tables, per kind. Mutated only by the hub task (register/unregister),
+/// so no locks on the hot path.
+struct KindRoutes {
+    by_index: HashMap<(IndexId, IndexValue), SmallVec<[WatcherId; 4]>>,
+    by_namespace: HashMap<NamespaceId, SmallVec<[WatcherId; 4]>>,
+    catch_all: Vec<WatcherId>,
+    /// Index values to extract from each object to look up `by_index`, i.e. only the
+    /// indexes some watcher is actually routed on.
+    active_indexes: SmallVec<[IndexId; 8]>,
+}
+
+struct WatcherSlot {
+    filter: WatchFilter,
+    tx: BoundedSender<Arc<EncodedEvent>>,   // capacity e.g. 1,024 events
+    last_sent: Revision,
+}
+
+/// Encoded lazily, at most once per (format, projection), shared by all recipients.
+pub struct EncodedEvent {
+    pub rev: Revision,
+    pub kind: EventKind,                    // Added | Modified | Deleted | Bookmark | Error
+    obj: Arc<StoredObject>,
+    encodings: [OnceLock<Bytes>; 2],        // Binary, Json (projections: side table)
+}
+
+pub trait WatchHub: Send + Sync {
+    fn register(&self, filter: WatchFilter, from: StartPoint)
+        -> Result<WatchStream, WatchError>;      // TooOld if `from` < history window
+    fn unregister(&self, id: WatcherId);
+}
+```
+
+Dispatch for one `Change` – note it considers **both** the old and the new object,
+because a watcher must see an object *leave* its filter:
+
+```rust
+fn dispatch(&mut self, ch: &Change) {
+    let routes = &self.kinds[ch.kind];
+    // 1. Candidates: union of watchers routed on old values and on new values.
+    let mut cands = CandidateSet::new();                    // small, dedup by WatcherId
+    for obj in [ch.prev.as_deref(), ch.next.as_deref()].into_iter().flatten() {
+        for idx in &routes.active_indexes {
+            for v in obj.index_values(*idx) {               // label/field values
+                cands.extend(routes.by_index.get(&(*idx, v)));
+            }
+        }
+        cands.extend(routes.by_namespace.get(&obj.namespace()));
+    }
+    cands.extend(&routes.catch_all);
+
+    let mut event: Option<Arc<EncodedEvent>> = None;
+    for id in cands {
+        let w = &mut self.watchers[id];
+        let was = ch.prev.as_ref().is_some_and(|o| w.filter.matches(o));
+        let is  = ch.next.as_ref().is_some_and(|o| w.filter.matches(o));
+        let kind = match (was, is) {
+            (false, true)  => EventKind::Added,      // created, or label now matches
+            (true,  true)  => EventKind::Modified,
+            (true,  false) => EventKind::Deleted,    // deleted, or moved out of filter
+            (false, false) => continue,
+        };
+        let ev = shared_event(&mut event, ch, kind); // one Arc per (change, kind)
+        if w.tx.try_send(ev).is_err() {              // full: never block the hub
+            self.terminate(id, WatchError::Overloaded { resume_from: w.last_sent });
+            continue;
+        }
+        w.last_sent = ch.rev;
+    }
+}
+```
+
+Cost per change: O(active indexes × values on the object + matched watchers), *not*
+O(watchers). With 5,000 agents each routed on `spec.node`, a pod update touches one
+`by_index` bucket (two if the node changed, which for pods it can't) and wakes one or
+two watchers. Encoding happens on the first `try_send` that needs the format, inside the
+receiving connection's task (`OnceLock` makes it once-only), so the hub thread does no
+serialisation at all.
+
+Bookmarks: a timer per kind enqueues `Bookmark(rev)` to every watcher of the kind whose
+`last_sent` is older than 60 s – a pass over the slot table once a minute, not per event.
+
 ## Watch protocol
 
 ```
