@@ -18,10 +18,10 @@ const MARKDOWN_EXTENSION: &str = "md";
 /// Reads and parses every `docs/**/*.md` under `repo_root`, and records which
 /// non-markdown targets of relative links exist on disk.
 ///
-/// Symbolic links are not followed. Existence is decided by the host filesystem, so on a
-/// case-insensitive filesystem (default macOS) a link to a non-doc path with the wrong
-/// case passes locally and fails on Linux CI. Links to docs are matched case-sensitively
-/// everywhere.
+/// Symbolic links are not followed when walking `docs/`. A non-doc target exists only if
+/// every path segment matches a directory entry exactly, so a link with the wrong case
+/// fails on a case-insensitive filesystem (default macOS) just as it does on Linux, and
+/// links to docs are matched exactly everywhere.
 pub fn load(repo_root: &Path) -> Result<DocSet, XtaskError> {
     let mut docs = BTreeMap::new();
     read_dir(&repo_root.join(DOCS_DIR), DOCS_DIR, &mut docs)?;
@@ -37,9 +37,25 @@ pub fn load(repo_root: &Path) -> Result<DocSet, XtaskError> {
         .collect();
     set.existing_targets = non_doc_targets
         .into_iter()
-        .filter(|resolved| repo_root.join(resolved.as_str()).exists())
+        .filter(|resolved| exists_with_exact_case(repo_root, resolved))
         .collect();
     Ok(set)
+}
+
+/// Whether `target` names an existing file or directory, comparing each segment's case
+/// against the directory listing instead of trusting the filesystem's lookup. A trailing
+/// `/` requires a directory.
+fn exists_with_exact_case(repo_root: &Path, target: &RelPath) -> bool {
+    let mut path = repo_root.to_path_buf();
+    for segment in target.as_str().split('/').filter(|s| !s.is_empty()) {
+        let listed = fs::read_dir(&path)
+            .is_ok_and(|entries| entries.flatten().any(|entry| entry.file_name() == segment));
+        if !listed {
+            return false;
+        }
+        path.push(segment);
+    }
+    !target.as_str().ends_with('/') || path.is_dir()
 }
 
 /// Parses the markdown files under `dir`, whose repository-relative path is `relative`.
@@ -129,6 +145,25 @@ mod tests {
         assert_eq!(docs, ["docs/README.md", "docs/a/one.md"]);
         let existing: Vec<_> = set.existing_targets.iter().map(RelPath::as_str).collect();
         assert_eq!(existing, ["README.md", "docs/a/"]);
+    }
+
+    // A mis-cased link must fail here even where the filesystem ignores case (macOS), so
+    // local and Linux CI results match.
+    #[test]
+    fn load_requires_exact_case_for_non_doc_targets() {
+        let repo = Scratch::new("case");
+        repo.write(
+            "docs/README.md",
+            "[ok](../README.md) [file](../sub/x.rs) [dir](../sub/) \
+             [bad1](../readme.md) [bad2](../sub/X.rs) [bad3](../Sub/) [bad4](../sub/x.rs/)",
+        );
+        repo.write("README.md", "# Root\n");
+        repo.write("sub/x.rs", "");
+
+        let set = load(&repo.0).unwrap();
+
+        let existing: Vec<_> = set.existing_targets.iter().map(RelPath::as_str).collect();
+        assert_eq!(existing, ["README.md", "sub/", "sub/x.rs"]);
     }
 
     #[test]

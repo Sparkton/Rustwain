@@ -122,7 +122,8 @@ fn reachable_docs<'a>(set: &'a DocSet, start: &'a RelPath) -> BTreeSet<&'a RelPa
     reached
 }
 
-/// Marker-shaped inline code spans whose word is not a known marker.
+/// Marker-shaped inline code spans whose word is a near miss of a known marker (a typo
+/// such as `[verfiy]`); see the `inline` module for why other words are left alone.
 pub fn markers(set: &DocSet) -> Vec<Finding> {
     let expected = Marker::ALL
         .iter()
@@ -231,6 +232,27 @@ mod tests {
                     "broken link `one.md/`: `docs/a/one.md/` does not exist".to_owned()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn doc_links_report_a_wrapped_broken_link_at_the_line_of_its_bracket() {
+        let set = fixture(
+            &[(
+                "docs/README.md",
+                "intro text\nsee [the long\nlink text](gone.md) and more\n",
+            )],
+            &[],
+        );
+
+        assert_eq!(
+            located(&doc_links(&set)),
+            [(
+                Check::DocLinks,
+                "docs/README.md".to_owned(),
+                2,
+                "broken link `gone.md`: `docs/gone.md` does not exist".to_owned()
+            )]
         );
     }
 
@@ -348,7 +370,7 @@ mod tests {
         let set = fixture(
             &[(
                 "docs/README.md",
-                "`[open]` **[verify]**\n```\n`[bogus]`\n```\n",
+                "`[open]` **[verify]**\n```\n`[verfiy]`\n```\n",
             )],
             &[],
         );
@@ -361,7 +383,7 @@ mod tests {
         let set = fixture(
             &[(
                 "docs/README.md",
-                "ok `[open]`\n\nbad `[maybe]` and `[nope, really]`",
+                "ok `[open]`\n\nbad `[verfiy]` and `[propsed, really]`",
             )],
             &[],
         );
@@ -375,13 +397,13 @@ mod tests {
                     Check::Markers,
                     "docs/README.md".to_owned(),
                     3,
-                    format!("unknown marker `[maybe]`; {expected}")
+                    format!("unknown marker `[verfiy]`; {expected}")
                 ),
                 (
                     Check::Markers,
                     "docs/README.md".to_owned(),
                     3,
-                    format!("unknown marker `[nope]`; {expected}")
+                    format!("unknown marker `[propsed]`; {expected}")
                 ),
             ]
         );
@@ -391,7 +413,7 @@ mod tests {
     fn check_runs_the_four_checks_in_order() {
         let set = fixture(
             &[
-                ("docs/README.md", "[gone](gone.md) [x](#nope) `[maybe]`"),
+                ("docs/README.md", "[gone](gone.md) [x](#nope) `[verfiy]`"),
                 ("docs/lost.md", "text"),
             ],
             &[],
