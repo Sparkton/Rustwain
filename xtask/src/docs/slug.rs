@@ -2,13 +2,17 @@
 
 use std::collections::BTreeSet;
 
-/// The anchor GitHub generates for a heading's text, before duplicate suffixes, which
-/// [`Anchors`] adds.
+use super::inline::plain_text;
+
+/// The anchor GitHub generates for a heading's rendered text, before duplicate suffixes,
+/// which [`Anchors`] adds.
 ///
 /// Lowercases, drops everything except letters, numbers, spaces, `-` and `_`, then turns
 /// each space into `-` without collapsing runs. Backticks are dropped but the code span's
-/// content is kept. Other inline markup (emphasis, links) is not rendered first, so it is
-/// treated as punctuation or text; no heading in the library uses it.
+/// content is kept.
+///
+/// Combining marks (Unicode `\p{M}`) are dropped, where GitHub keeps them: std has no
+/// category table for them, and the library is written in English.
 pub fn github_slug(heading: &str) -> String {
     heading
         .to_lowercase()
@@ -26,8 +30,10 @@ pub(super) struct Anchors {
 }
 
 impl Anchors {
-    pub fn allocate(&mut self, heading: &str) -> String {
-        let base = github_slug(heading);
+    /// The anchor for a heading written as `markup`: links, emphasis and comments are
+    /// rendered away first, so `## See [intro](a.md)` anchors as `see-intro`.
+    pub fn allocate(&mut self, markup: &str) -> String {
+        let base = github_slug(&plain_text(markup));
         let mut anchor = base.clone();
         let mut suffix = 0u32;
         while self.used.contains(&anchor) {
@@ -60,6 +66,23 @@ mod tests {
         ];
         for (heading, expected) in cases {
             assert_eq!(github_slug(heading), expected, "heading: {heading}");
+        }
+    }
+
+    #[test]
+    fn heading_markup_is_rendered_before_slugging() {
+        let cases = [
+            ("See [intro](a.md) now", "see-intro-now"),
+            ("_Why_ **now**", "why-now"),
+            ("snake_case naming", "snake_case-naming"),
+            ("`snake_case` and `a*b`", "snake_case-and-ab"),
+        ];
+        for (markup, expected) in cases {
+            assert_eq!(
+                Anchors::default().allocate(markup),
+                expected,
+                "markup: {markup}"
+            );
         }
     }
 

@@ -21,7 +21,8 @@ pub struct Doc {
     pub links: Vec<Link>,
     pub markers: Vec<(Marker, NonZeroU32)>,
     /// The word of inline code spans shaped like a marker (`` `[word]` ``) whose word is
-    /// not one of the known markers.
+    /// not a known marker but is a near miss of one, such as `verfiy`. Other words are
+    /// not recorded.
     pub unknown_markers: Vec<(String, NonZeroU32)>,
 }
 
