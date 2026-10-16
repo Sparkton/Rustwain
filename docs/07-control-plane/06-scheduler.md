@@ -13,8 +13,9 @@ preferences are optimised, fast, at scale, without double-booking.
 
 - One pod at a time from a priority queue. For each pod: filter all (or a sample of)
   nodes → score feasible nodes → pick best → assume (update cache) → bind async.
-- `percentageOfNodesToScore` (adaptive, ~50% at 100 nodes down to 5% at 5,000) trades
-  quality for speed.
+- `percentageOfNodesToScore` (adaptive linear default: ~50% at 100 nodes, ~10% at 5,000,
+  never below 5%; and at least 100 feasible nodes are always considered) trades quality
+  for speed.
 - Throughput: published targets ~100–300 pods/s for typical configs; inter-pod
   (anti-)affinity historically made it O(pods × nodes) and much slower.
 - **No gang/batch awareness** (one pod at a time can deadlock gangs: half of a 64-GPU job
@@ -52,7 +53,7 @@ pub struct SelectorId(u32);           // interned, canonicalised label selector
 #[derive(Clone)]
 pub struct Snapshot {
     pub generation: u64,
-    pub nodes: im::OrdMap<NodeId, Arc<NodeInfo>>,
+    pub nodes: imbl::OrdMap<NodeId, Arc<NodeInfo>>,
     pub domains: DomainIndex,          // node → domain per topology key, and inverse
     pub counters: DomainCounters,      // label-selector counts per domain
     pub anti: AntiAffinityIndex,       // existing pods' anti-affinity terms (symmetry)
@@ -67,23 +68,23 @@ pub struct NodeInfo {
     pub attributes: AttributeSet,
     pub taints: SmallVec<[Taint; 4]>,
     pub numa: Vec<NumaFree>,           // free exclusive CPUs / hugepages / devices per NUMA node
-    pub pods: im::HashSet<PodKey>,
+    pub pods: imbl::HashSet<PodKey>,
 }
 
 pub struct DomainIndex {
     node_domain: HashMap<(NodeId, TopologyKey), DomainValue>,
-    domain_nodes: HashMap<(TopologyKey, DomainValue), im::OrdSet<NodeId>>,
+    domain_nodes: HashMap<(TopologyKey, DomainValue), imbl::OrdSet<NodeId>>,
     /// Domains eligible for spread counting (nodes the pod could tolerate are decided
     /// per pod at PreFilter; this is the full list).
-    domains_of: HashMap<TopologyKey, im::OrdSet<DomainValue>>,
+    domains_of: HashMap<TopologyKey, imbl::OrdSet<DomainValue>>,
 }
 
 /// Counters exist only for selectors that some pending pod or some existing pod's
 /// affinity term actually uses — never for every label combination.
 pub struct DomainCounters {
     registry: SelectorRegistry,        // SelectorId → (Selector, refcount)
-    counts: im::HashMap<(SelectorId, TopologyKey), im::HashMap<DomainValue, u32>>,
-    epochs: im::HashMap<SelectorId, u64>, // bumped on any count change; equivalence-cache key
+    counts: imbl::HashMap<(SelectorId, TopologyKey), imbl::HashMap<DomainValue, u32>>,
+    epochs: imbl::HashMap<SelectorId, u64>, // bumped on any count change; equivalence-cache key
 }
 
 impl DomainCounters {
@@ -91,7 +92,7 @@ impl DomainCounters {
     pub fn count(&self, sel: SelectorId, key: TopologyKey, dom: DomainValue) -> u32;
     /// O(domains of key). Used by TopologySpread to compute global min for max-skew.
     pub fn min_over(&self, sel: SelectorId, key: TopologyKey,
-                    eligible: &im::OrdSet<DomainValue>) -> u32;
+                    eligible: &imbl::OrdSet<DomainValue>) -> u32;
     /// Called by the snapshot builder for every bound/assumed/removed pod.
     /// Cost: O(registered selectors that match the pod's labels × topology keys in use).
     pub fn on_pod(&mut self, pod: &PodLabels, node: NodeId, d: &DomainIndex, delta: i32);
@@ -111,7 +112,7 @@ impl SelectorRegistry {
 /// Symmetric anti-affinity: "existing pod P says: no pod matching S in P's zone".
 /// Indexed by domain so an incoming pod checks only the terms of its candidate domain.
 pub struct AntiAffinityIndex {
-    terms: im::HashMap<(TopologyKey, DomainValue), im::HashMap<SelectorId, u32>>,
+    terms: imbl::HashMap<(TopologyKey, DomainValue), imbl::HashMap<SelectorId, u32>>,
 }
 
 /// Single writer, many readers. Scheduling cycles grab an Arc<Snapshot> and never

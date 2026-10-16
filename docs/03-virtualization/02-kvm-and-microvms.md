@@ -52,7 +52,7 @@ host
  └─ rustwain-supervisor (pod)          cgroup: rustwain.slice/.../pod-<uid>
      ├─ virtiofsd (Rust, vhost-user-fs) ← serves the pod's rootfs + volumes dir
      ├─ VMM process (cloud-hypervisor)  ← cgroup: pod-<uid>/vmm  (vCPU threads, IO threads)
-     │    ├─ virtio-net  ← TAP in pod netns (dataplane wires it like a veth)
+     │    ├─ virtio-net  ← TAP fd passed in by the agent (TAP lives in the host netns)
      │    ├─ virtio-fs   ← vhost-user socket to virtiofsd
      │    ├─ virtio-blk  ← (block volumes, or block rootfs)
      │    ├─ virtio-vsock← supervisor ↔ guest agent
@@ -105,9 +105,14 @@ identity via vsock. Firecracker restores in ~5–30 ms. Caveats:
 
 ## Networking
 
-- Dataplane creates a TAP (instead of netkit/veth peer) inside the pod netns, attaches
-  the same BPF programs to the host-side interface. Policy and service LB work unchanged
-  because they operate on the host side.
+- Dataplane creates a TAP (instead of a netkit/veth pair) **in the host netns**, attaches
+  the BPF programs to it, and passes the TAP fd to the VMM. The VMM process itself runs
+  in an **empty netns** (loopback only), so a compromised VMM can reach the network only
+  through the TAP fd, where policy applies. An earlier draft put the TAP inside a pod
+  netns. That needs a veth plus in-netns redirect between veth and TAP (the Kata layout,
+  kept there for CNI compatibility), which costs an extra hop and buys nothing without
+  CNI. Policy and service LB operate on the TAP host interface; see the
+  [microVM packet walk](../05-networking/03-ebpf-dataplane.md#packet-walk-microvm-pod--service).
 - Socket-level service LB (cgroup/connect hooks) does **not** apply inside the guest
   (guest has its own kernel) → services are resolved by the host-side TC program
   (per-packet DNAT) for VM pods. The dataplane must support both paths.

@@ -80,7 +80,7 @@ Backends:
 |---|---|---|
 | `NativeBackend` | `process` | Namespaces + cgroups + seccomp + LSM, via supervisor |
 | `SandboxBackend` | `sandboxed` | `[open]` gVisor-style; or native + strict seccomp/landlock "hardened process" |
-| `MicroVmBackend` | `microvm` | Supervisor runs built-in VMM; guest agent starts containers |
+| `MicroVmBackend` | `microvm` | Supervisor runs a Cloud Hypervisor process (embedded VMM later, see [KVM and microVMs](../03-virtualization/02-kvm-and-microvms.md)); guest agent starts containers |
 | `VmBackend` | `vm` | Long-lived full VMs (disk images, not OCI containers) |
 | `ExternalCriBackend` | any | `[open]` adapter to an existing CRI runtime for compatibility (Kata, gVisor's runsc) |
 

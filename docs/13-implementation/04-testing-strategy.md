@@ -43,6 +43,11 @@ distro cloud images where possible (realistic configs) plus a minimal custom-con
 - Multi-VM topologies with a virtual bridge for cluster tests; `tc netem` / BPF-based fault
   injection on the host bridge.
 - Runs locally on any Linux dev box with KVM; CI runners need nested virt or bare metal.
+  GitHub-hosted x86_64 Linux runners expose `/dev/kvm` (after a udev permission rule)
+  `[verify]`; hosted arm64 runners most likely do not, so aarch64 VM tests need
+  self-hosted or bare-metal runners.
+- On the macOS dev machine, `xtask vm-test` runs inside the Linux dev VM (`xtask devvm`,
+  see [roadmap M0](03-roadmap.md#m0--foundations)), not on macOS itself.
 
 ## Fault injection hooks
 - `failpoints` (`fail` crate) compiled in test builds at critical points (after intent log
@@ -55,7 +60,12 @@ to a test reproducing the Kubernetes failure scenario and showing Rustwain's beh
 (e.g. PP-62: measure DNS queries per external lookup; PP-65: zero failed requests during
 rollout under load).
 
+## CI pipeline
+What runs on every push and PR, and how the latency budgets become gates, is specified in
+[design 0001 – CI pipeline](../design/0001-ci-pipeline.md).
+
 ## Developer loop
+- `cargo xtask ci` runs the same fast checks as CI, locally (macOS or Linux).
 - `cargo test` for pure crates on any OS.
 - `cargo xtask vm-test <suite>` for privileged tests on Linux with KVM.
 - `rustwain dev` for manual exploration.

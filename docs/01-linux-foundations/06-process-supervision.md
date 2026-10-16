@@ -62,8 +62,10 @@ at `/.rustwain/init` – no image modification.
 1. Agent decides to start a pod. It writes a fully resolved **pod execution spec**
    (`/run/rustwain/pods/<uid>/spec.bin`) – every path, every ID mapping, every seccomp
    program already compiled. The supervisor does **no policy decisions**.
-2. Agent spawns the supervisor with `clone3(CLONE_INTO_CGROUP=<pod>/supervisor)` +
-   `execve("/usr/local/bin/rustwain", ["rustwain", "supervise", uid])`. The supervisor
+2. Agent spawns the supervisor with `clone3(CLONE_INTO_CGROUP=<pod>/supervisor)` into
+   the delegated pods unit ([cgroups v2](02-cgroups-v2.md#systemd-interplay)) +
+   `execve("/usr/local/bin/rustwain-supervisor", ["rustwain-supervisor", uid])` (a
+   separate small binary, see [crate layout](../13-implementation/01-crate-layout.md)). The supervisor
    immediately `setsid()`s and **double-checks its parent is not needed** (it does not
    depend on the agent staying alive).
 3. Supervisor creates the sandbox (namespaces – see [namespaces](01-namespaces.md)),

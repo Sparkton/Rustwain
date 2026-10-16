@@ -31,7 +31,7 @@ mapping, every pod looks like a host) and it's what software expects.
 | IPv6-first | Single-stack v6 supported as first-class; dual-stack default |
 | Encryption built-in | WireGuard between nodes, one flag |
 | Fast pod network setup | netkit/veth via netlink, no CNI exec chain |
-| Works on old-ish kernels | nftables fallback dataplane |
+| Works where BPF is unavailable | nftables fallback dataplane `[later]` (not needed for kernel age – the 5.15 floor has every hook we use) |
 | Observable | Every drop has a reason code exported via a ring buffer `[later with observability]` |
 
 ## Components

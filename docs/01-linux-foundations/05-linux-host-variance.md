@@ -40,7 +40,7 @@ Proposed `[proposed]` matrix (2026):
 
 | Distro | Versions | Kernel (default) | Tier | Notes |
 |---|---|---|---|---|
-| Ubuntu LTS | 24.04, 26.04 | 6.8, 6.17+ | 1 | AppArmor, systemd, netplan/systemd-networkd |
+| Ubuntu LTS | 24.04, 26.04 | 6.8 (HWE later), 7.0 | 1 | AppArmor, systemd, netplan/systemd-networkd |
 | Debian | 12, 13 | 6.1, 6.12 | 1 | AppArmor, systemd |
 | Fedora | latest two | 6.x latest | 1 | SELinux enforcing, NetworkManager, firewalld |
 | RHEL / Rocky / Alma | 9, 10 | 5.14 (heavily backported), 6.12 | 1 | SELinux, firewalld; RHEL 9's "5.14" has many 6.x backports – **probe features, never infer from version** |
@@ -75,7 +75,7 @@ What we need, and the version it arrived:
 | `cpu.max.burst` | 5.14 | optional | none |
 | `memory.reclaim` | 5.19 | optional | no proactive reclaim |
 | PSI | 4.20 | **Required** for eviction | usage-based eviction (degraded) |
-| BTF (`/sys/kernel/btf/vmlinux`) | 5.4+ with `CONFIG_DEBUG_INFO_BTF=y` | Required for eBPF dataplane | nftables dataplane |
+| BTF (`/sys/kernel/btf/vmlinux`) | 5.4+ with `CONFIG_DEBUG_INFO_BTF=y` | Optional – only for CO-RE, kfuncs, fentry/LSM programs. The core dataplane (TC, XDP, cgroup sock_addr) uses stable UAPI contexts and needs no kernel BTF | Those features off |
 | BPF `cgroup/connect4/6`, `sendmsg`, `recvmsg`, `getpeername` hooks | 4.17 / 5.8 (getpeername) | eBPF dataplane | nftables DNAT |
 | TCX (`bpf_mprog`) attach | 6.6 | optional | classic TC clsact |
 | netkit devices | 6.7 | optional | veth |
@@ -101,8 +101,10 @@ actual capability tests are authoritative.
 
 Notable differences:
 - `CONFIG_DEBUG_INFO_BTF`: on in Ubuntu, Fedora, RHEL 8.2+, Debian 11+, Arch; **off** in
-  some custom/embedded kernels and older Alpine `-lts`. Without BTF, CO-RE eBPF won't
-  load → we fall back or ship BTFHub-style external BTF (`[open]`).
+  some custom/embedded kernels and older Alpine `-lts`. Without kernel BTF, CO-RE
+  programs and BTF-dependent features (kfuncs, fentry, BPF-LSM) won't load. The **core
+  dataplane does not need it** (see the BTF row in the kernel floor table), so a missing
+  BTF only disables those optional features.
 - `CONFIG_BPF_LSM` and `lsm=` order: rarely enabled by default.
 - `CONFIG_PSI_DEFAULT_DISABLED`: RHEL kernels? (some builds need `psi=1`).
 - `CONFIG_USER_NS` + distro knobs (Debian `kernel.unprivileged_userns_clone`, Ubuntu
@@ -136,11 +138,11 @@ We do not link a D-Bus library in core – for the few calls needed (inhibitor l
 ### systemd pitfalls
 - **cgroup ownership:** without delegation systemd may "fix" cgroups it doesn't know
   about. Always run under a unit with `Delegate=yes`.
-- **`KillMode`:** agent unit must use `KillMode=process` (or put supervisors in a
-  separate cgroup outside the agent's unit) so restarting the agent doesn't kill
-  supervisors. Our layout puts supervisors under `rustwain.slice/...pod-*`, not under
-  the agent service's cgroup, so `KillMode=control-group` on the agent only kills the
-  agent.
+- **`KillMode` and delegation:** supervisors must not live in the agent unit's cgroup, or
+  restarting the agent kills them. They live under a separate delegated unit,
+  `rustwain-pods.service` (see [cgroups v2](02-cgroups-v2.md#systemd-interplay)), so the
+  agent keeps the default `KillMode=control-group`. Note that systemd delegates only
+  service and scope units – a slice cannot be delegated.
 - **Shutdown ordering:** systemd stops services in reverse dependency order; pods
   need time to drain. Use logind inhibitor `delay` locks with `InhibitDelayMaxSec` set
   ≥ our shutdown grace period (Kubernetes GracefulNodeShutdown does the same).

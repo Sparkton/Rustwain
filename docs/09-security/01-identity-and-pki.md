@@ -37,7 +37,7 @@ Rustwain:
 - `rwctl pki status`: every cert's expiry, upcoming rotations; alerts if renewals fail.
 
 Crates: `rustls` (TLS), `rcgen` (cert generation), `x509-parser`/`x509-cert` (parsing),
-`ring`/`aws-lc-rs` (crypto; aws-lc-rs for FIPS mode option).
+`ring`/`aws-lc-rs` (crypto; non-FIPS builds – see [Rust ecosystem](../13-implementation/02-rust-ecosystem.md)).
 
 ## Agent bootstrap (TLS bootstrapping)
 1. Join token (short-lived, scoped `join:<pool>`, single- or multi-use) or platform
@@ -88,7 +88,8 @@ IAM can trust cluster workloads (like EKS IRSA/GKE WI). Signing keys rotate with
 
 - Single root vs separate roots for control plane and workloads (separation lets workload
   trust be federated without exposing control-plane trust).
-- FIPS mode via aws-lc-rs – when?
+- FIPS mode: out of scope while tooling is Rust-only. `aws-lc-fips-sys` needs CMake and Go
+  at build time. Revisit only if a user needs FIPS.
 
 ## Build checklist
 

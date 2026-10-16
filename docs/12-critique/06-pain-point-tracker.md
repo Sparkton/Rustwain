@@ -91,6 +91,7 @@ design docs, issues and commits (`PP-53`).
 | PP-5E | OOMKilled misreported for child processes | L | memory.events oom_kill counter | — | [supervision](../01-linux-foundations/06-process-supervision.md) | designed |
 | PP-5F | Node-pressure eviction ignores PodDisruptionBudgets and can over-evict (several pods for one pressure event) | M | One eviction in flight per resource at `Evict` level; prefer pods with budget headroom in ranking; zero-grace only at `Emergency` | Slower relief at moderate pressure | [eviction](../04-node-agent/04-resources-qos-eviction.md) | designed |
 | PP-5G | kubelet crash/restart leaves orphaned state ("orphaned pod found, but volume paths are still present on disk", leaked cgroups/netns) | M | Intent-before-effect checkpoint, UID-named host artifacts, orphan GC before admitting new pods, crash-point test matrix | Every step must be idempotent | [pod lifecycle](../04-node-agent/02-pod-lifecycle.md) | designed |
+| PP-5H | cgroup driver mismatch (kubelet `cgroupfs` vs runtime `systemd`) and systemd killing or "fixing" foreign cgroups | M | One driver chosen automatically; pods live in a dedicated delegated `rustwain-pods.service`, so agent restarts never touch them | One extra systemd unit | [cgroups v2](../01-linux-foundations/02-cgroups-v2.md) | designed |
 
 ## Networking
 
@@ -177,6 +178,7 @@ visible next to the problem it solves.
 | PP-R3 | Leader-local leases stretch dead-node detection to ~2× lease duration after an unplanned leader failover | L | Lease-table handover on planned transfer; `[open]` replicated suspect list | Non-durable heartbeats (PP-23) | [state store](../07-control-plane/02-state-store.md) | designed |
 | PP-R4 | MicroVM pods need per-packet NAT and conntrack (guest kernel bypasses socket LB) | M | Separate preallocated `ct` map for TAP endpoints; `CtFull` drops new flows, never established ones | MicroVM isolation class | [dataplane](../05-networking/03-ebpf-dataplane.md) | designed |
 | PP-R5 | First use of a new affinity/spread selector costs an O(pods) backfill in the scheduler | L | Selector registry with refcounts; backfill off the scheduling hot path | Domain counters (PP-31) | [scheduler](../07-control-plane/06-scheduler.md) | designed |
+| PP-R6 | Supervisors are never upgraded in place, and now also carry restart logic, so a supervisor bug lives as long as its pod | L | Restart logic is one tiny shared pure function, property-tested; `SupervisorOutdated` condition + recycle-on-rollout policy | Supervisor autonomy during agent outages | [pod lifecycle](../04-node-agent/02-pod-lifecycle.md) | designed |
 
 ## Things we deliberately won't fix (or not yet)
 

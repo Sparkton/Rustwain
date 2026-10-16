@@ -19,9 +19,10 @@ rustwain install            # copies binary, writes systemd unit (or OpenRC scri
 ```
 
 `rustwain install` writes:
-- `/usr/local/bin/rustwain` (+ `rwctl` symlink),
-- `rustwain-server.service` / `rustwain-agent.service` with `Delegate=yes`,
-  `KillMode=process` semantics as designed (see host variance),
+- `/usr/local/bin/rustwain` and `/usr/local/bin/rustwain-supervisor` (+ `rwctl` symlink),
+- `rustwain-server.service`, `rustwain-agent.service` and the delegated
+  `rustwain-pods.service` under `rustwain.slice` (layout and reasoning in
+  [cgroups v2](../01-linux-foundations/02-cgroups-v2.md#systemd-interplay)),
 - NetworkManager/networkd drop-ins for `rw*` devices,
 - sysctl drop-in `/etc/sysctl.d/90-rustwain.conf`,
 - modules-load drop-in for needed modules (`geneve`, `wireguard`, …).

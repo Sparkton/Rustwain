@@ -178,14 +178,19 @@ what is on disk, what is running, and what does the restarted agent do?*
    record to the checkpoint DB (`agent.db`, redb, one fsynced transaction), then
    performs the effect, then writes *done*. Recovery treats `intent` without `done` as
    "may or may not have happened" and re-runs the step, which must be idempotent.
-2. **Everything on the host is named by pod UID.** cgroup `rustwain.slice/pod-7c1e….scope`,
-   netns `/run/rustwain/netns/7c1e…`, mounts under `/var/lib/rustwain/pods/7c1e…/`, BPF
-   `endpoints` entries tagged with UID, supervisor socket `/run/rustwain/sup/7c1e….sock`.
+2. **Everything on the host is named by pod UID.** cgroup `…/<qos>/pod-7c1e…/` (layout in
+   [cgroups v2](../01-linux-foundations/02-cgroups-v2.md)), netns
+   `/run/rustwain/netns/7c1e…`, mounts under `/var/lib/rustwain/pods/7c1e…/`, BPF
+   `endpoints` entries tagged with UID, supervisor control socket
+   `/run/rustwain/pods/7c1e…/ctl.sock`.
    So recovery can always find what exists, and **orphan GC** can always tell whose it is.
 3. **Supervisors outlive the agent.** Each pod's supervisor is its own process (not a
    child the agent reaps), holds the namespaces, reaps container processes and records
-   their exits with a monotonically increasing `event_seq`. It keeps the last 256 events
-   in memory and replays from the agent's `last_acked_seq` on reconnect.
+   their exits with a monotonically increasing `event_seq`. Unacknowledged events are kept
+   in the supervisor's **state file** (atomic rename after each transition, see
+   [process supervision](../01-linux-foundations/06-process-supervision.md)), so they
+   survive even a supervisor restart of its event loop, and are replayed from the
+   agent's `last_acked_seq` on reconnect.
 
 #### Recovery entry point
 
@@ -193,7 +198,7 @@ what is on disk, what is running, and what does the restarted agent do?*
 agent start (epoch := epoch + 1, persisted)
   │
   ├─ 1. open agent.db; load PodRecords (state, intents, allocations, last_acked_seq)
-  ├─ 2. scan host: cgroups under rustwain.slice, /run/rustwain/sup/*.sock,
+  ├─ 2. scan host: pod cgroups, /run/rustwain/pods/*/ctl.sock,
   │     /run/rustwain/netns/*, mounts under /var/lib/rustwain/pods/*, pinned BPF
   │     endpoint entries
   ├─ 3. join: for each UID → (record?, host artifacts?)
@@ -265,9 +270,10 @@ vs DRA).
    │          duration of the outage (no liveness kills while blind);         │
    │          readiness is **kept at its last value** until the first probe   │
    │          result after restart (not flipped to false → no endpoint churn  │
-   │          on every agent upgrade). Exits during the outage are replayed;  │
-   │          restart decisions happen on reconnect with backoff computed     │
-   │          from the recorded exit timestamps.                              │
+   │          on every agent upgrade). While disconnected, the supervisor     │
+   │          applies the pod's restart policy itself (see below); on         │
+   │          reconnect it hands back restart counts and backoff state and    │
+   │          the agent decides again.                                        │
    │                                                                          │
    │ delete requested; PodRecord{Terminating, started_at(wall), boot_id,      │
    │                             drain_started_at, grace=30s}                 │
@@ -309,13 +315,34 @@ vs DRA).
 | I – terminated, unreported | final status, `reported=false` | nothing | Resend status | Pod object deleted without final status |
 | Reboot (boot ID changed) | all records | nothing | Every pod is dead: report `Failed{NodeRebooted}` for `Never` pods, re-create sandboxes for others (pods are *restarted*, not resumed); free all allocations except quarantine | Resuming a "Running" record whose processes no longer exist |
 
+#### Who restarts containers while the agent is down `[proposed]`
+
+[HA and failure modes](../10-cluster-operations/03-ha-and-failure-modes.md) left this
+open. Decision: **one decision-maker at a time.**
+
+- **Agent connected:** the agent decides every restart; the supervisor only executes.
+- **Agent disconnected for more than 5 s:** the supervisor applies the restart policy,
+  exit-code rules and backoff that were part of the `ResolvedPodSpec`. Liveness and
+  readiness probes stay in the agent, so a hung (not exited) container is not restarted
+  until the agent is back.
+- **Reconnect:** the supervisor reports restart counts, last exit and backoff deadline
+  in the `Hello` reply. The agent adopts them and takes back control.
+- **No duplicated logic:** the restart decision is one pure function
+  (`fn next_action(policy, history, now) -> RestartAction`) in a small crate that both the
+  agent and the supervisor link.
+- **Trade-off:** supervisors are never upgraded in place
+  ([upgrades](../10-cluster-operations/02-upgrades-and-compat.md)). A bug in that function
+  lives until the pod is recreated. That is why the function stays tiny and is
+  property-tested.
+
 #### Testing it
 
-Each `✖` above is a named **crash point** (`crashpoint!("sandbox.after_spawn")`)
-compiled in under a `crash-points` cargo feature. The integration suite iterates over
+Each `✖` above is a named **failpoint** (`fail_point!("sandbox.after_spawn")`, the
+`fail` crate, compiled in only with the `failpoints` cargo feature – as in the
+[testing strategy](../13-implementation/04-testing-strategy.md)). The integration suite iterates over
 every registered point: run the pod lifecycle, `abort()` the agent at that point, restart
 it, and assert the invariants in the last column plus "the final API state equals the
-no-crash run". This is cheap to run in CI (`cargo xtask crash-matrix`) and turns
+no-crash run". It runs in the privileged VM suite (`cargo xtask vm-test crash-matrix`) and turns
 "every stage is resumable" from a claim into a test (pain point `PP-5G`).
 
 ## Open questions

@@ -163,6 +163,7 @@ depends on decisions made below it.
 | [04-storage-and-etcd-pros-cons](12-critique/04-storage-and-etcd-pros-cons.md) | etcd, CSI, Rook/Ceph, Longhorn, local-path |
 | [05-alternatives-landscape](12-critique/05-alternatives-landscape.md) | Nomad, Swarm, k3s, Talos, Borg/Omega papers, Fly.io, ECS |
 | [06-pain-point-tracker](12-critique/06-pain-point-tracker.md) | Every known pain point → Rustwain answer → status |
+| [07-design-review](12-critique/07-design-review.md) | Assumptions checked against sources, flaws fixed, open risks, verdict on the plan |
 
 ### 13 – Implementation
 | Doc | Covers |
@@ -171,6 +172,14 @@ depends on decisions made below it.
 | [02-rust-ecosystem](13-implementation/02-rust-ecosystem.md) | Which crates we build on, and which we write ourselves |
 | [03-roadmap](13-implementation/03-roadmap.md) | Milestones from "run one container" to "multi-node cluster" |
 | [04-testing-strategy](13-implementation/04-testing-strategy.md) | Unit, integration, kernel matrix, chaos, fuzzing |
+
+### Design docs (implementation contracts)
+Numbered docs in `design/` are what code is built against. They follow the
+`write-design-doc` template and need the user's acceptance before implementation.
+
+| Doc | Status | Covers |
+|---|---|---|
+| [0001-ci-pipeline](design/0001-ci-pipeline.md) | Accepted | CI on GitHub Actions driven by `cargo xtask`: docs integrity, policy, Rust hygiene, host facts, kernel-floor latency gates |
 
 ## Conventions used in every doc
 

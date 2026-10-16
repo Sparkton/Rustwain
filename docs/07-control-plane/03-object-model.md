@@ -118,9 +118,9 @@ stays pending). Rustwain:
   (see GC doc).
 
 ## Immutability
-- Fields marked `#[immutable]` (e.g. `pod.spec.containers[].image`? – no, that's mutable in
-  k8s; immutable ones: pod `volumes`, service `clusterIP`, claim `storageClass`, job
-  `selector`) reject updates with a clear error listing the field.
+- Fields marked `#[immutable]` reject updates with a clear error listing the field. Examples:
+  pod `volumes`, service `clusterIP`, claim `storageClass`, job `selector`. Container
+  `image` stays mutable, as in Kubernetes.
 - Whole-object immutability option for config/secret (`immutable: true`) – lets agents
   stop watching them (Kubernetes' immutable ConfigMaps/Secrets: big scalability win).
 

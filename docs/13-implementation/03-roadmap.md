@@ -10,30 +10,52 @@ M0 Foundations ─▶ M1 Single node ─▶ M2 Node networking ─▶ M3 Control
      ─▶ M7 Production shape ─▶ M8 Advanced (batch, VMs, mesh, autoscaling)
 ```
 
+## Before any milestone: design gate
+The design library (`docs/<area>/…`) is the research layer. Under the project's agent
+policy, code for a component starts only after a numbered design doc in `docs/design/`
+(`NNNN-slug.md`, written with the `write-design-doc` skill) has been **accepted by the
+user**. Each milestone below therefore starts by turning the relevant library docs into
+1–3 design docs with ticket-sized implementation plans. The first one is
+[0001 – CI pipeline](../design/0001-ci-pipeline.md).
+
 ## M0 – Foundations
-- Workspace skeleton, lints, dependency rules, CI (fmt, clippy, tests, deny/audit).
+- CI pipeline per [design 0001](../design/0001-ci-pipeline.md): docs integrity, repo policy,
+  Rust hygiene, host facts and kernel-floor latency checks on Linux runners.
+- Workspace skeleton, lints, dependency rules, `cargo-deny` (licences, advisories, banned
+  crates).
 - `xtask` with VM test runner (boot a cloud image VM with Cloud Hypervisor/QEMU, copy
   binaries, run integration tests as root inside).
+- **macOS development loop**: the primary dev machine is a Mac. Pure crates build and
+  test natively. Everything privileged runs in a Linux VM (`xtask devvm`: aarch64 guest
+  via Virtualization.framework, project shared over virtiofs). KVM-in-guest (needed for
+  M6 locally) requires an M3-or-later Mac on macOS 15+ with nested virtualization – not
+  yet confirmed for Linux guests `[verify]`. Otherwise M6 work runs on a Linux box or in
+  CI.
 - `rustwain-sys`, `rustwain-cgroup` basics, `rustwain-probe` + `rustwain doctor`.
 - **Exit**: `rustwain doctor` runs on Ubuntu, Debian, Fedora, Alpine VMs and reports
   correct features.
 
 ## M1 – Single-node runtime (`rustwain agent --standalone`)
-- Image store: pull (auth, multi-arch), unpack (sandboxed), overlay snapshots, GC basics.
-- `rustwain-container` + supervisor + `rustwain-init`.
-- Pod spec subset: multiple containers, init containers, sidecars, env, command, volumes
-  (scratch, host, config files from local dir), resources (cgroups), restart policy,
-  probes (http/tcp/exec), logs, exec/attach (local CLI), userns default, seccomp default.
-- Static pods from directory.
-- Agent restart without disruption.
+Too large for one step; split into three increments, each with its own design doc:
+- **M1a – process sandbox:** `rustwain-container` + `rustwain-supervisor` + `rustwain-init`
+  running a container from a *local rootfs directory* (no images yet): namespaces, userns
+  by default, cgroups in the delegated pods unit, seccomp default, logs, restart policy,
+  agent restart without disruption (the crash-point matrix from
+  [pod lifecycle](../04-node-agent/02-pod-lifecycle.md)).
+- **M1b – images:** pull (auth, multi-arch), sandboxed unpack, overlay snapshots, GC
+  basics.
+- **M1c – pod features:** multiple containers, init containers, sidecars, env, command,
+  volumes (scratch, host, config files from local dir), probes (http/tcp/exec),
+  exec/attach (local CLI), static pods from a directory.
 - **Exit**: run a multi-container pod (nginx + sidecar) on all Tier-1 distros; kill -9 agent
   mid-run → pods unaffected; security invariant tests pass; pod start p50 < 150 ms warm.
 
 ## M2 – Node networking
-- Dataplane: netkit/veth setup, local IPAM, eBPF loader with Aya, pinned maps.
+- Dataplane: netkit/veth setup, local IPAM, eBPF loader with Aya, pinned maps. BPF crate
+  on a pinned nightly toolchain; programs use UAPI contexts only (no CO-RE).
 - Pod connectivity on one node; host ports; masquerade egress.
 - Node-local DNS (static zone from local config at this stage).
-- nftables fallback.
+- (nftables fallback moved to M7: the kernel floor already has every hook we need.)
 - **Exit**: pods on one node reach each other and the internet; `BPF_PROG_TEST_RUN`
   suite green on kernel matrix (5.15, 6.1, 6.6, 6.12, latest).
 
@@ -47,7 +69,9 @@ M0 Foundations ─▶ M1 Single node ─▶ M2 Node networking ─▶ M3 Control
 - Scheduler with core plugins.
 - `rwctl` basics (get/apply/delete/logs/exec).
 - **Exit**: single-server control plane + agent in `rustwain dev` runs a Deployment;
-  linearizability checker passes under simulated faults for the store.
+  linearizability checker passes under simulated faults for the store; store RSS with
+  150k simulated pods and a 10k writes/s burst stays within the per-server budget
+  (validates the in-memory history bound and change journal).
 
 ## M4 – Multi-node cluster
 - 3-server Raft, join flows, PKI with rotation, node leases, node lifecycle.
@@ -73,6 +97,7 @@ M0 Foundations ─▶ M1 Single node ─▶ M2 Node networking ─▶ M3 Control
   policy and services work identically.
 
 ## M7 – Production shape
+- nftables fallback dataplane (hosts where BPF is unavailable).
 - Upgrades (rolling servers, in-place agents, feature levels), backups/restore, audit,
   events store, API fairness, admission policies (CEL), workload security levels,
   tenants, image signature verification, `rwctl why`, import adapter for Kubernetes YAML.
@@ -96,7 +121,8 @@ M0 Foundations ─▶ M1 Single node ─▶ M2 Node networking ─▶ M3 Control
 - Add regression tests demonstrating each Kubernetes failure mode we claim to fix.
 
 ## How work is executed
-Code changes follow the project's agent workflow (orchestrated parallel implementers on
-disjoint slices with cross-review), defined in the repo's agent skills. Each milestone is
+Code changes follow the project's 3-1 agent workflow (three parallel implementers on
+disjoint slices, one orchestrator, cross-review), defined in the repo's agent skills, and
+only against an accepted `docs/design/` doc. Each milestone is
 broken into slices along the crate boundaries in [crate layout](01-crate-layout.md),
 which are chosen so slices rarely touch the same files.
