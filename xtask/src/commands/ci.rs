@@ -1,8 +1,11 @@
 //! The `ci` aggregate: the local equivalent of the blocking CI jobs.
 //!
 //! The steps run in order and all run to completion, so one run lists every failing
-//! step. A step that fails is a result; only xtask itself failing (a loader error, a
-//! cargo binary that cannot be started) aborts the run with an `Err`.
+//! step. A step can fail two ways. A check with errors or a cargo run that exits
+//! non-zero is a failed result and exits with status 1. Xtask itself failing (a loader
+//! error, a cargo binary that cannot be started) is printed, counts as a failed step,
+//! and does not stop the run; the first such error is then returned, so the exit status
+//! is 2.
 
 use std::{
     env,
@@ -11,7 +14,7 @@ use std::{
     process::{Command, ExitCode},
 };
 
-use super::{DOCS_CHECK, POLICY_CHECK, check_docs, check_policy, exit_code};
+use super::dispatch::{DOCS_CHECK, POLICY_CHECK, check_docs, check_policy, exit_code};
 use crate::{
     cli::SkipArgs,
     error::XtaskError,
@@ -61,29 +64,59 @@ pub(super) fn run(root: &Path, output: &Output, skip: &SkipArgs) -> Result<ExitC
         skip,
         cargo: cargo_program(env::var_os(CARGO_VAR)),
     };
-    let results = run_steps(&STEPS, |step| ci.run_step(step))?;
-    output.steps(CI_TITLE, &results)?;
+    let steps = run_steps(&STEPS, |step| {
+        ci.run_step(step)
+            .inspect_err(|error| output.tool_failure(error))
+    });
+    output.steps(CI_TITLE, &steps.results)?;
     output.skips(skip)?;
-    Ok(steps_exit_code(&results))
+    steps.exit_status()
 }
 
-/// Runs every step, whatever the earlier ones returned, and pairs each with its name.
+/// What a `ci` run produced.
+struct Steps {
+    /// One per step, in order.
+    results: Vec<StepResult>,
+    /// The first failure of xtask itself; later ones were reported but are not kept.
+    first_error: Option<XtaskError>,
+}
+
+/// Runs every step, whatever the earlier ones returned, and pairs each with its name. A
+/// step that returns an error counts as failed.
 fn run_steps(
     steps: &[Step],
     mut run_step: impl FnMut(Step) -> Result<StepOutcome, XtaskError>,
-) -> Result<Vec<StepResult>, XtaskError> {
-    steps
-        .iter()
-        .map(|&step| Ok(StepResult::new(step.name(), run_step(step)?)))
-        .collect()
+) -> Steps {
+    let mut run = Steps {
+        results: Vec::with_capacity(steps.len()),
+        first_error: None,
+    };
+    for &step in steps {
+        let outcome = match run_step(step) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                run.first_error.get_or_insert(error);
+                StepOutcome::Failed
+            }
+        };
+        run.results.push(StepResult::new(step.name(), outcome));
+    }
+    run
 }
 
-fn steps_exit_code(results: &[StepResult]) -> ExitCode {
-    exit_code(
-        results
-            .iter()
-            .all(|result| result.outcome == StepOutcome::Passed),
-    )
+impl Steps {
+    /// Status 1 when any step failed. A tool error is returned as is, so `main` exits
+    /// with 2 even though every step ran.
+    fn exit_status(self) -> Result<ExitCode, XtaskError> {
+        match self.first_error {
+            Some(error) => Err(error),
+            None => Ok(exit_code(
+                self.results
+                    .iter()
+                    .all(|result| result.outcome == StepOutcome::Passed),
+            )),
+        }
+    }
 }
 
 impl Ci<'_> {
@@ -175,22 +208,28 @@ mod tests {
         );
     }
 
+    fn outcomes(steps: &Steps) -> Vec<StepOutcome> {
+        steps.results.iter().map(|result| result.outcome).collect()
+    }
+
+    fn tool_error(input: &str) -> XtaskError {
+        XtaskError::InvalidRange {
+            input: input.to_owned(),
+        }
+    }
+
     #[test]
     fn every_step_runs_after_a_failure_and_the_run_fails() {
         let mut started = Vec::new();
 
-        let results = run_steps(&STEPS, |step| {
+        let steps = run_steps(&STEPS, |step| {
             started.push(step);
             Ok(StepOutcome::from_success(step != Step::PolicyCheck))
-        })
-        .unwrap();
+        });
 
         assert_eq!(started, STEPS);
         assert_eq!(
-            results
-                .iter()
-                .map(|result| result.outcome)
-                .collect::<Vec<_>>(),
+            outcomes(&steps),
             [
                 StepOutcome::Passed,
                 StepOutcome::Failed,
@@ -199,29 +238,44 @@ mod tests {
                 StepOutcome::Passed,
             ]
         );
-        assert_eq!(steps_exit_code(&results), ExitCode::FAILURE);
+        assert_eq!(steps.exit_status().unwrap(), ExitCode::FAILURE);
     }
 
     #[test]
     fn run_succeeds_when_every_step_passed() {
-        let results = run_steps(&STEPS, |_| Ok(StepOutcome::Passed)).unwrap();
+        let steps = run_steps(&STEPS, |_| Ok(StepOutcome::Passed));
 
-        assert_eq!(steps_exit_code(&results), ExitCode::SUCCESS);
+        assert_eq!(steps.exit_status().unwrap(), ExitCode::SUCCESS);
     }
 
     #[test]
-    fn tool_failure_aborts_the_run() {
-        let mut started = 0;
+    fn tool_error_fails_its_step_and_the_first_error_is_returned_after_every_step_ran() {
+        let mut started = Vec::new();
 
-        let result = run_steps(&STEPS, |_| {
-            started += 1;
-            Err(XtaskError::InvalidRange {
-                input: "x".to_owned(),
-            })
+        let steps = run_steps(&STEPS, |step| {
+            started.push(step);
+            match step {
+                Step::PolicyCheck => Err(tool_error("first")),
+                Step::Cargo(CargoStep::Clippy) => Err(tool_error("second")),
+                _ => Ok(StepOutcome::Passed),
+            }
         });
 
-        assert!(result.is_err());
-        assert_eq!(started, 1);
+        assert_eq!(started, STEPS);
+        assert_eq!(
+            outcomes(&steps),
+            [
+                StepOutcome::Passed,
+                StepOutcome::Failed,
+                StepOutcome::Passed,
+                StepOutcome::Failed,
+                StepOutcome::Passed,
+            ]
+        );
+        assert!(matches!(
+            steps.exit_status(),
+            Err(XtaskError::InvalidRange { input }) if input == "first"
+        ));
     }
 
     #[test]

@@ -79,6 +79,12 @@ impl Output {
         println!("==> {name}");
     }
 
+    /// Prints a failure of xtask itself that does not end the run, the way `main` prints
+    /// one that does.
+    pub fn tool_failure(&self, error: &XtaskError) {
+        eprintln!("xtask: {error}");
+    }
+
     /// Prints the final pass/fail table of the `ci` steps and appends it to the summary.
     pub fn steps(&self, title: &str, steps: &[StepResult]) -> Result<(), XtaskError> {
         print!("{}", render_steps_terminal(title, steps));
