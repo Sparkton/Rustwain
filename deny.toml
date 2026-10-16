@@ -1,0 +1,32 @@
+# cargo-deny configuration (design 0001), checked by .github/workflows/deny.yml with the
+# cargo-deny version pinned there. Only keys that cargo-deny 0.16 and later accept are
+# used; the removed pre-0.16 keys (`vulnerability`, `unlicensed`, `copyleft`, ...) are
+# not.
+
+[advisories]
+# Defaults: known vulnerabilities and unmaintained crates fail the check.
+
+[licenses]
+# Every license found in Cargo.lock: Apache-2.0 and MIT for the dependency tree, and
+# Unicode-3.0 for the tables in unicode-ident.
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+
+[licenses.private]
+# The workspace crates are `publish = false` and carry no license obligations.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+deny = [
+    { crate = "im", reason = "unmaintained, RUSTSEC-2026-0248; use imbl" },
+    { crate = "serde_yml", reason = "unsound, RUSTSEC-2025-0068; use serde_norway or serde_yaml_ng" },
+    { crate = "openssl-sys", reason = "Rustwain uses rustls with aws-lc-rs" },
+    { crate = "rocksdb", reason = "the state store is embedded openraft with in-memory MVCC" },
+    { crate = "aws-lc-fips-sys", reason = "FIPS builds are out of scope" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
