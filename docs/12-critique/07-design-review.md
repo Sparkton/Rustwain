@@ -112,6 +112,5 @@ There are two documentation layers, and the policy treats them differently:
 - **numbered design docs** (`docs/design/NNNN-*.md`, Draft → In Review → Accepted by the
   user): implementation contracts for the 3-1 workflow.
 
-The design-doc index (`docs/design/README.md`) and the agent policy live on the
-`sparkton/agent-skills-and-policy` branch. When that branch merges, add the row for 0001
-to its index.
+The design-doc index ([`docs/design/README.md`](../design/README.md)) lists 0001, and the
+agent policy (`AGENTS.md`, `.agent/skills`) is on `main`.

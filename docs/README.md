@@ -175,7 +175,9 @@ depends on decisions made below it.
 
 ### Design docs (implementation contracts)
 Numbered docs in `design/` are what code is built against. They follow the
-`write-design-doc` template and need the user's acceptance before implementation.
+`write-design-doc` template and need the user's acceptance before implementation. The
+[design doc index](design/README.md) lists them with their dependencies, and
+[anti-patterns](anti_patterns.md) lists the patterns code must not introduce.
 
 | Doc | Status | Covers |
 |---|---|---|

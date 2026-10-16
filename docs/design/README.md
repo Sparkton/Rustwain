@@ -4,3 +4,4 @@ Design docs for the project, written with the `write-design-doc` skill. Componen
 
 | # | Title | Status | Depends on |
 |---|-------|--------|------------|
+| [0001](0001-ci-pipeline.md) | CI pipeline | Accepted | none |
