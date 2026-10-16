@@ -6,10 +6,6 @@
 //! return [`report::Finding`]s, and `commands` and `output` turn those into terminal
 //! text, GitHub annotations, the job summary and the exit status.
 
-// Skeleton allowance for ticket T1: stub parameters are unused until each slice fills
-// its bodies. The orchestrator removes this at integration.
-#![allow(unused_variables)]
-
 pub mod cli;
 pub mod commands;
 pub mod docs;
