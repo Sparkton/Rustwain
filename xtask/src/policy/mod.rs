@@ -7,6 +7,7 @@ mod branch;
 mod check;
 mod commits;
 mod files;
+mod git;
 mod load;
 mod range;
 
