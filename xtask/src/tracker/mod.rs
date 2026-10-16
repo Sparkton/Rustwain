@@ -8,8 +8,9 @@ mod checks;
 mod load;
 mod lockfile;
 mod model;
+mod table;
 
 pub use checks::{check, parse_rows, tracker_ids, tracker_schema};
-pub use load::{SourceText, TrackerInput, load};
+pub use load::{LOCKFILE_PATH, SourceText, TRACKER_PATH, TrackerInput, load};
 pub use lockfile::lock_ids;
-pub use model::{PainPointId, PainPointStatus, TrackerRow};
+pub use model::{PainPointId, PainPointSeverity, PainPointStatus, TrackerRow};
