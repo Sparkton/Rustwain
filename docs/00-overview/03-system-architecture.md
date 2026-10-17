@@ -55,7 +55,7 @@ through what happens for the common operations. Later documents zoom into each b
 | `rustwain server` | control-plane machines | 1 per server (3 or 5 servers) | API, store replica, watch hub, scheduler, controllers |
 | `rustwain agent` | every node | 1 | Everything node-local |
 | `rustwain-supervisor` | every node | 1 per pod | Holds namespaces/cgroup, reaps children, owns stdio/logs, survives agent restarts |
-| VMM (built-in, rust-vmm based) | nodes running `microvm`/`vm` pods | 1 per VM pod | Runs the guest |
+| VMM (Cloud Hypervisor process first; embedded rust-vmm VMM is a later learning milestone) | nodes running `microvm`/`vm` pods | 1 per VM pod | Runs the guest |
 | `rustwain-guest` | inside each microVM | 1 per VM | Minimal init + container launcher inside the guest |
 | `rwctl` | user machines | – | CLI |
 
@@ -69,7 +69,7 @@ cilium-agent…), CoreDNS/NodeLocal DNSCache, CSI node plugins, log agent.
 |---|---|---|---|
 | Client → API | gRPC over HTTP/2 + JSON gateway | mTLS or bearer token | gRPC is the canonical API; JSON gateway for humans/scripts |
 | Server ↔ Server (Raft) | gRPC streams | mTLS with server certs | Separate port from client API |
-| Agent → API | gRPC streams | mTLS with node cert | Agents only watch objects bound to themselves |
+| Agent → API | gRPC streams | mTLS with node cert | Agents watch their own pods plus the node bundle (objects those pods reference), and cluster-wide dataplane state (services, endpoint sets, identities, policy). The latter is O(cluster) per node by nature, so it is sliced and delta-encoded |
 | Agent → Supervisor | Unix socket, length-prefixed protobuf/`postcard` | Filesystem permissions + `SO_PEERCRED` | Local only |
 | Agent → Guest agent | vsock | VM is only reachable from its own supervisor | |
 | Pod → Pod | Kernel networking + eBPF | Network policy by identity | Optional WireGuard between nodes |
@@ -135,7 +135,9 @@ See [eBPF dataplane](../05-networking/03-ebpf-dataplane.md).
 ## Walkthrough 3: node failure
 
 1. Node 3 stops renewing its **lease** (default every 5 s, TTL 20 s; tunable).
-2. The **node lifecycle controller** marks the node `Unreachable` and taints it.
+2. The **node lifecycle task** marks the node `Unknown` and taints it `unreachable`. It runs
+   on the Raft leader, because the leader-local lease table lives there (see
+   [state store](../07-control-plane/02-state-store.md#3-leader-failover-with-leader-local-leases)).
 3. After the toleration window (per-pod, default 60 s for stateless), pods are marked
    for deletion and their owners create replacements, which the scheduler places
    elsewhere.
@@ -154,7 +156,7 @@ See [HA and failure modes](../10-cluster-operations/03-ha-and-failure-modes.md).
 2. Supervisors keep running; containers are unaffected; the eBPF programs and maps are
    **pinned** in bpffs so networking continues.
 3. New agent starts, reads its on-disk checkpoint, reconnects to every supervisor socket
-   in `/run/rustwain/pods/*`, re-adopts pinned BPF maps, re-syncs with the API, and
+   (`/run/rustwain/pods/*/ctl.sock`), re-adopts pinned BPF maps, re-syncs with the API, and
    reconciles any differences.
 4. Zero workload disruption is a hard requirement for agent restarts.
 

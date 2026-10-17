@@ -21,7 +21,7 @@ accident of design; we make it an explicit, tested requirement.)
 | All servers down | Agents can't connect | Data plane static; no changes possible | Restart servers; agents reconnect and reconcile |
 | Server disk full | Store write failures | Writes fail | Alarms early (store size quota); compaction/snapshot; disk expansion |
 | Slow disk on a server (fsync latency) | Raft metrics | Elevated write latency; possibly leader churn | Leader transfer away from slow member; alarms |
-| Agent down (process) | Supervisor sockets idle; lease expiry | Pods keep running; no status updates; no restarts of crashed containers (supervisor doesn't restart them — `[open]`: should supervisors handle simple restarts autonomously?) | systemd restarts agent; recovers state |
+| Agent down (process) | Supervisor sockets idle; lease expiry | Pods keep running; no status updates; crashed containers restarted by their supervisor per policy after 5 s of disconnection (probe-driven restarts wait for the agent) | systemd restarts agent; recovers state |
 | Node down (power/kernel panic) | Lease expiry (20 s) | Pods lost | Node lifecycle controller → replacements after toleration windows; exclusive volumes wait for fencing |
 | Node partitioned from servers only | Lease expiry | Pods keep serving local/peer traffic; replacements may start elsewhere (stateless) | Self-fencing for singleton/exclusive-volume pods; on heal, agent deletes pods that were replaced |
 | Zone outage | Many leases expire in one zone | Capacity loss | Zone-aware eviction rate limiting; topology spread places replacements in other zones |
@@ -33,12 +33,14 @@ accident of design; we make it an explicit, tested requirement.)
 | Clock skew | Heartbeat timestamp comparison (informational) | Certificate validity issues | NTP; correctness does not depend on clock sync |
 | Store corruption (bug) | Checksums on snapshots/log entries | Member can't start | Wipe member, rejoin from peers; or restore from backup |
 
-## Supervisor autonomy during agent outage `[open]`
+## Supervisor autonomy during agent outage `[proposed]`
 If the agent is down for minutes (crash loop due to a bug), crashed containers aren't
 restarted because restart policy lives in the agent. Option: give the supervisor the
 pod's restart policy and backoff, so it restarts containers itself and reports later.
-Pro: better static stability. Con: logic duplication and a bigger supervisor. Lean: yes
-for the simple `Always`/`OnFailure` restart with backoff; probes stay in the agent.
+Pro: better static stability. Con: a bigger supervisor that is never upgraded in place.
+Decision: yes, for the restart policy, exit-code rules and backoff only, using one pure
+function shared by agent and supervisor; probes stay in the agent. The handover protocol
+is in [pod lifecycle](../04-node-agent/02-pod-lifecycle.md#who-restarts-containers-while-the-agent-is-down-proposed).
 
 ## Control-plane sizing and placement
 - Servers on separate failure domains (zones/racks).
@@ -64,7 +66,6 @@ See [backup and DR](07-backup-and-disaster-recovery.md). Quorum loss recovery pr
 
 ## Open questions
 
-- Supervisor-level restarts (above).
 - Should agents be able to fetch state from *peer agents* when servers are down (e.g. new
   endpoints)? No – static stability means no changes, which is the simpler, safer model.
 

@@ -156,19 +156,22 @@ default-off on some RHEL kernels – `CONFIG_PSI_DEFAULT_DISABLED`). The probe c
 
 ```
 /sys/fs/cgroup/
-├─ system.slice/                         (systemd services, incl. rustwain-agent.service)
+├─ system.slice/                         (systemd services)
 ├─ user.slice/
-└─ rustwain.slice/                       (delegated to rustwain by systemd)
-   ├─ rustwain-system/                   (agent, supervisors' own overhead – reserved)
-   ├─ guaranteed/
-   │  └─ pod-<uid>/
-   │     ├─ supervisor/                  (supervisor process – charged to pod overhead)
-   │     ├─ c-app/                       (container leaf)
-   │     └─ c-sidecar/
-   ├─ burstable/
-   │  └─ pod-<uid>/...
-   └─ besteffort/
-      └─ pod-<uid>/...
+└─ rustwain.slice/                       (plain slice: ordering + reservation, NOT delegated)
+   ├─ rustwain-agent.service/            (the agent; KillMode=control-group is fine)
+   └─ rustwain-pods.service/             (Delegate=yes – our private subtree)
+      ├─ keeper/                         (tiny idle main process; DelegateSubgroup=keeper)
+      ├─ rustwain-system/                (supervisors' fixed overhead – reserved)
+      ├─ guaranteed/
+      │  └─ pod-<uid>/
+      │     ├─ supervisor/               (supervisor process – charged to pod overhead)
+      │     ├─ c-app/                    (container leaf)
+      │     └─ c-sidecar/
+      ├─ burstable/
+      │  └─ pod-<uid>/...
+      └─ besteffort/
+         └─ pod-<uid>/...
 ```
 
 - QoS tiers are interior nodes with policy: `besteffort` gets minimal `cpu.weight` and no
@@ -185,10 +188,20 @@ systemd over D-Bus to create scopes/slices). Kubernetes requires them to match b
 kubelet and runtime, and mismatches are a classic misconfiguration.
 
 Decision `[decided]`: **one driver, chosen automatically:**
-- On systemd hosts, `rustwain-agent.service` sets `Delegate=yes` and
-  `DelegateSubgroup=` (systemd 254+) or we create `rustwain.slice` with delegation.
-  systemd then promises never to touch anything below it, and we write cgroupfs
-  directly within our delegated subtree. No D-Bus scope creation per container – it is
+- On systemd hosts, delegation is granted to a **dedicated unit,
+  `rustwain-pods.service`** (`Delegate=yes`, `DelegateSubgroup=keeper` on systemd 254+,
+  `ExecStart=rustwain-supervisor --keeper`, which just sleeps). systemd only delegates
+  *service and scope* units, never slices, so "a delegated `rustwain.slice`" (an earlier
+  draft of this layout) is not possible. systemd then promises never to touch anything
+  below the pods unit, and the agent writes cgroupfs directly in that subtree (spawning
+  supervisors with `CLONE_INTO_CGROUP`).
+- Why a separate unit and not `Delegate=yes` on the agent's own service: anything in the
+  agent unit's cgroup dies when the agent unit restarts under the default
+  `KillMode=control-group`. The workaround, `KillMode=process`, is discouraged by systemd
+  and leaves stray processes counted against the agent unit. With a separate pods unit,
+  restarting the agent touches no pod. Stopping `rustwain-pods.service` (node shutdown)
+  deliberately kills every pod; it is ordered `After=rustwain-agent.service`, so systemd
+  stops it first and the agent's graceful-shutdown inhibitor runs before that. No D-Bus scope creation per container – it is
   slow (tens of ms per call) and makes systemd a bottleneck at high pod churn.
 - On non-systemd hosts (Alpine/OpenRC, minimal images), we own the tree directly
   under a top-level `rustwain` cgroup.

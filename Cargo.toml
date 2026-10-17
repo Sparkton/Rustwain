@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["xtask"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.93"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+as_conversions = "warn"
+dbg_macro = "warn"
+unwrap_used = "warn"

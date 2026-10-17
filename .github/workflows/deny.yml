@@ -1,0 +1,39 @@
+# Dependency policy (design 0001). A separate workflow from ci.yml because GitHub path
+# filters apply per workflow: this runs only when dependency files change, plus weekly
+# so that newly published advisories surface without a dependency change.
+
+name: deny
+
+on:
+  pull_request:
+    paths: [Cargo.lock, deny.toml, '**/Cargo.toml']
+  push:
+    branches: [main]
+    paths: [Cargo.lock, deny.toml, '**/Cargo.toml']
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # cargo-deny runs `cargo metadata`, which needs the toolchain pinned in
+      # rust-toolchain.toml to be installed.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Check dependencies
+        run: cargo deny check

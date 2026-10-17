@@ -11,7 +11,7 @@ omitted; pin at implementation time.
 | HTTP/2, HTTP/1 | `hyper`, `h2` | |
 | gRPC | `tonic` + `prost` | Watch streams, plugin interfaces |
 | Middleware | `tower` | Request pipeline layers |
-| TLS | `rustls` (+ `aws-lc-rs` or `ring` provider) | aws-lc-rs for a FIPS path |
+| TLS | `rustls` (+ `aws-lc-rs` or `ring` provider) | Both providers need a C compiler (accepted, via `cc`, for audited crypto). **FIPS mode is out of scope**: `aws-lc-fips-sys` also needs CMake and Go at build time, which breaks the Rust-only tooling rule |
 | Cert generation / parsing | `rcgen`, `x509-parser` / RustCrypto `x509-cert` | |
 | HTTP client (registry, ACME) | `reqwest` (rustls) or `hyper-util` client | |
 | QUIC/HTTP3 (later) | `quinn`, `h3` | Gateway |
@@ -24,9 +24,9 @@ omitted; pin at implementation time.
 | Raft | `openraft` (lean) / `raft-rs` | See state store doc |
 | Embedded KV (snapshots, agent checkpoint, image metadata) | `redb` | Pure Rust, ACID, simple |
 | LSM option | `fjall` | If write-heavy needs arise |
-| Persistent/immutable maps (MVCC snapshots) | `im` / `rpds` / own B-tree | `[open]` – performance-critical; may write our own |
+| Persistent/immutable maps (MVCC snapshots, scheduler snapshot) | `imbl` / `rpds` / own B-tree | `[open]` – performance-critical; may write our own. **Not `im`**: unmaintained, archived 2026-05 (RUSTSEC-2026-0248); `imbl` is the maintained fork |
 | Serialization (internal) | `prost` (protobuf), `postcard` (compact, no_std), `serde` | |
-| Compression | `zstd`, `flate2` (zlib-rs backend) | Images, snapshots |
+| Compression | `zstd` (C via `cc`), `flate2` (zlib-rs backend, pure Rust) | Images, snapshots |
 | Object storage | `object_store` | Backups |
 
 ## Linux system interfaces
@@ -54,7 +54,7 @@ omitted; pin at implementation time.
 ## API, policy, schema
 | Need | Choice | Notes |
 |---|---|---|
-| JSON/YAML | `serde_json`, `serde_yaml` successor (`serde_yml` / `yaml-rust2`-based) | serde_yaml is archived – pick a maintained fork |
+| JSON/YAML | `serde_json`; YAML via `serde_norway` or `serde_yaml_ng` (maintained `serde_yaml` forks) | `serde_yaml` is archived. **Avoid `serde_yml`**: unsound, archived (RUSTSEC-2025-0068). Pure-Rust YAML options exist but are less complete – evaluate at M3 |
 | JSON Schema / OpenAPI gen | `schemars` (+ custom extensions) | |
 | CEL | `cel-interpreter` (cel-rust) | Evaluate maturity; contribute |
 | Expression typing over Rust structs | own glue | |
@@ -109,5 +109,10 @@ omitted; pin at implementation time.
 - Node-local DNS zone logic.
 
 ## Open questions
-- YAML library choice (ecosystem churn after serde_yaml archival).
+- YAML library choice (ecosystem churn after the `serde_yaml` archival and the `serde_yml`
+  advisory).
+- C dependencies policy: allowed only when built by `cc` alone (no CMake, Go, Python or
+  system packages) and when no mature pure-Rust option exists. `cargo-deny` bans the
+  known offenders (`openssl-sys`, `rocksdb`, `aws-lc-fips-sys`) so the rule is enforced,
+  not remembered.
 - CEL completeness.

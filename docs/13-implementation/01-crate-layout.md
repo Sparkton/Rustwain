@@ -56,7 +56,8 @@ rustwain/
 │  └─ cli/
 │     └─ rwctl
 └─ bins/
-   └─ rustwain                   single binary: dispatches `server`, `agent`, `supervise`, `dev`, `doctor`, ...
+   ├─ rustwain                   main binary: dispatches `server`, `agent`, `dev`, `doctor`, ...
+   └─ rustwain-supervisor        separate small binary: per-pod supervisor and the pods-unit keeper
 ```
 
 ## Dependency rules (enforced)
@@ -75,16 +76,30 @@ rustwain/
   `clippy::expect_used = warn`, `missing_docs` for public SDK crates.
 - Release profile: `lto = "fat"`, `codegen-units = 1`, `panic = "unwind"` for agent/server
   (module supervision), `panic = "abort"` for supervisor/init (smaller, simpler) – requires
-  separate binaries or careful configuration (`[open]`: same-binary supervisor can't have a
-  different panic strategy → argues for separate supervisor binary).
+  separate binaries. Decision `[proposed]`: **the supervisor is its own binary.** One
+  supervisor process runs per pod, so its private memory multiplies by pod count. A
+  supervisor that execs the 50–60 MB `rustwain` binary shares its text pages, but each
+  process still dirties that binary's relocated data (GOT, vtables in static-pie),
+  `.data`/`.bss` and allocator setup. That is likely to break the < 1 MB PSS budget
+  (measure in M1). A separate binary also gets `panic = "abort"` and `opt-level = "s"`.
 - Size: `opt-level = "s"` for supervisor/init/guest.
+
+## Toolchains
+- Stable Rust for the whole workspace, pinned in `rust-toolchain.toml`.
+- **`rustwain-bpf` needs nightly** (`-Z build-std=core` for the tier-3
+  `bpfel-unknown-none` target) and `bpf-linker`. Keep it out of the default workspace
+  build. `xtask` builds it with a pinned nightly and embeds the object into
+  `rustwain-dataplane` (via `include_bytes!` from `OUT_DIR`, or a prebuilt artifact path
+  for CI and macOS hosts where `bpf-linker` is awkward to install).
+- CO-RE relocations from Rust BPF programs are still experimental in `bpf-linker`, so the
+  dataplane programs must not depend on them (they only touch stable UAPI contexts).
 
 ## Feature flags
 - Minimal: `microvm`, `nftables-fallback`, `selinux`, `apparmor` features to trim builds
   for constrained targets. Default build includes everything.
 
 ## Open questions
-- Single `rustwain` binary vs separate `rustwain-supervisor` (panic strategy, size).
+- Measure supervisor PSS early (M1). The separate-binary decision rests on that number.
 - Use existing netlink crates (`rtnetlink`, `netlink-packet-*`, `wireguard-uapi`) vs
   own encoders.
 

@@ -59,9 +59,16 @@ design for an embedded store is:
 
 Decision `[proposed]`: **in-memory state machine + Raft log + snapshots**, with an
 on-disk engine (redb/fjall) only as a *snapshot format* option. Bound: dataset must fit in
-RAM (we cap total store size, default 8 GiB, and enforce per-namespace/tenant quotas on
-object count/bytes). This collapses etcd + watch cache into one data structure and
+RAM (we cap **live object bytes**, default 4 GiB, and enforce per-namespace/tenant quotas
+on object count/bytes). This collapses etcd + watch cache into one data structure and
 removes the double memory cost.
+
+Sizing check (5k nodes / 150k pods, the [budget](../11-efficiency/01-performance-budgets.md)
+target of < 8 GB RSS per server): live objects ≈ 1–2 GiB encoded (pods dominate at
+~4–8 KiB each), × ~1.5 for persistent-map nodes, `Arc` headers and indexes ≈ 3 GiB, plus
+the in-memory history window (bounded by bytes, below), API buffers and watch queues.
+The live-bytes cap must therefore stay well below the RSS target; an earlier draft used
+8 GiB for both, which cannot hold.
 
 ### Data model
 ```
@@ -73,9 +80,21 @@ meta:  create_revision, mod_revision, version (per-key modification count), leas
   (one revision per Raft entry; a batch of writes in one entry shares it – or use
   `(index, sub-index)` encoded into one u64 `[open]`).
 - MVCC history: per key, a small list of `(revision, value | tombstone)` versions retained
-  within the **history window** (time- or revision-bounded, e.g. last 10 minutes or 100k
-  revisions), then compacted. Persistent structure (`im`-style HAMT/B-tree with
-  structural sharing) lets readers hold a consistent snapshot at revision N cheaply.
+  within the **in-memory history window**, then compacted. The window is bounded by
+  **bytes** (default 512 MiB), not only by time or revision count. A time bound alone
+  doesn't work at the write target: 10k writes/s × ~4 KiB × 10 minutes ≈ 24 GB.
+  Persistent structure (`imbl`-style HAMT/B-tree with structural sharing; `im` itself is
+  unmaintained, RUSTSEC-2026-0248) lets readers hold a consistent snapshot at revision N
+  cheaply.
+- **Change journal** `[proposed]`: older history is served from disk. The apply loop
+  appends one compact record per revision `(rev, key, new value | tombstone,
+  prev_mod_revision, prev index values)` to a segmented append-only file, fsynced lazily
+  (it is rebuildable from the Raft log). Watch resumes older than the in-memory window
+  but newer than the journal's retention (default ≥ 15 min) replay sequentially from the
+  journal. `prev index values` (labels and indexed fields of the previous version) let
+  the watch hub compute "left the filter" events without loading the previous object.
+  This keeps resume-after-disconnect working during large rollouts, exactly when the
+  in-memory window turns over fastest.
 
 ### Operations (state machine commands)
 ```rust
@@ -102,8 +121,9 @@ load):
 ### Watch
 - Every applied entry produces change events `(revision, key, prev_value, new_value)`.
 - Watchers subscribe with `(prefix | index predicate, from_revision)`.
-- If `from_revision` is within the history window: replay from history then live.
-  Otherwise: `410 Gone`-equivalent `TooOld` → client relists.
+- If `from_revision` is within the in-memory window: replay from memory then live. If it
+  is within the change journal: replay from disk, then memory, then live. Otherwise:
+  `410 Gone`-equivalent `TooOld` → client re-runs watch-list.
 - Fan-out: see [watch and caching](04-watch-and-caching.md).
 
 ### Durability and performance
@@ -117,8 +137,11 @@ load):
 
 ### Leases and time
 - Raft leader **lease reads** (leader serves reads without a quorum round trip while its
-  lease is valid) depend on bounded clock drift; openraft supports leader lease. We use
-  ReadIndex by default (safe without clock assumptions) and lease reads optionally.
+  lease is valid) depend on bounded clock drift. openraft exposes both through
+  `ensure_linearizable(ReadPolicy::ReadIndex | ReadPolicy::LeaseRead)` (0.10 API; 0.9
+  takes no policy argument). We use ReadIndex by default (safe without clock
+  assumptions) and lease reads optionally. Note: openraft 0.10 is still an alpha series
+  at the time of writing. Pin one line and keep it behind our own `Consensus` trait.
 - Node heartbeats: leader-local, non-persisted (see
   [registration](../04-node-agent/05-node-registration-and-heartbeat.md)).
 
@@ -225,10 +248,12 @@ Step-by-step invariants:
 6. **Response from the follower waits for local apply.** S2 replies only once its *own*
    `applied ≥ 1137`. This gives read-your-writes for any subsequent read the client
    sends to S2, and S2's watch streams will already have delivered `rev 1137` to
-   S2-connected watchers. Cost: up to one heartbeat interval (default 50 ms) of extra
-   latency on follower-originated writes; the leader piggybacks `commit` on the
-   `ProposalResult` so in practice S2 can apply as soon as the entries are in its log
-   (it already has them – they arrived in the same AppendEntries batch).
+   S2-connected watchers. S2 learns the new commit index from the leader's next
+   AppendEntries. The leader sends that message as soon as commit advances, not on the
+   250 ms heartbeat tick ([HA defaults](../10-cluster-operations/03-ha-and-failure-modes.md)).
+   So the extra cost for follower-originated writes is about one RTT, not one heartbeat
+   interval. Without that eager commit broadcast, follower writes would pay up to
+   250 ms – worth an explicit test.
 
 Failure cases on this path:
 
@@ -338,9 +363,11 @@ t=1.52s                         commit 1200 (own + S3 fsync)
                                 for every Node in store:
                                   last_renewal := now (t=1.52s)
                                   i.e. grace = full lease_duration
-                                node lifecycle controller
-                                re-acquires its lease (fencing token
-                                term 8 / epoch++)
+                                node lifecycle task starts here: it
+                                is pinned to the Raft leader (the
+                                lease table lives there), fenced by
+                                the Raft term, not by a separate
+                                controller lease
 t=1.6s                                                                agents discover
 ..4s                                                                  leader (redirect);
                                                                       jittered renewals
@@ -388,7 +415,9 @@ Invariants and reasoning:
    ```
    Two independent fences: (a) the write needs a quorum S1 doesn't have; (b) even if a
    proposal were somehow delayed and committed later, the `leader_epoch == 7` compare
-   fails once term 8's controller epoch is in the store (PP-41 lease-token preconditions).
+   fails once the term-8 leader has committed its first entry, which records `leader_epoch =
+   8` in the store (the same lease-token precondition idea as PP-41, keyed on the Raft
+   term instead of a controller lease).
 4. **Agents must not self-fence during failover.** Agent self-fencing triggers after
    `lease_duration + safety_margin` (20 s + 5 s) without a successful renewal. Failover
    (~1.5 s) plus herd catch-up (~3 s) is far inside that. The server's reschedule wait

@@ -71,7 +71,7 @@ and test against them in CI. Headline targets:
 |---|---|---|
 | Node agent idle RSS (all node components) | 150–400 MB | < 40 MB |
 | Per-container supervisor RSS | ~5–10 MB (containerd-shim) | < 1 MB |
-| Pod start, warm image, p50 | 1–2 s | < 300 ms |
+| Pod start, warm image, p50 | 1–2 s | < 400 ms end-to-end via API; 150 ms on the node ([budgets](../11-efficiency/01-performance-budgets.md#latency)) |
 | Service rule update, 10k services | seconds (iptables) | < 10 ms, O(1) |
 | Pods per node | 110 default | 500+ supported, limited by hardware |
 | Control plane memory, 5k nodes / 150k pods | tens of GB | target < 8 GB |

@@ -17,9 +17,16 @@ kube-proxy iptables/IPVS/nftables modes.
 - **Aya** (`aya`, `aya-ebpf`): pure-Rust eBPF library – both the userspace loader *and*
   the kernel-side programs are written in Rust (compiled with the BPF target
   `bpfel-unknown-none` via `bpf-linker`). No libbpf, no clang/C toolchain required.
-- Supports BTF/CO-RE relocations for kernel struct access, maps of all common types,
-  TC (clsact + TCX), XDP, cgroup hooks, kprobes/tracepoints, LSM, ring buffers, map
-  pinning in bpffs.
+- Supports maps of all common types, TC (clsact + TCX), XDP, cgroup hooks,
+  kprobes/tracepoints, LSM, ring buffers and map pinning in bpffs. The *loader* handles
+  CO-RE relocations for objects that carry them. But **emitting** CO-RE relocations from
+  Rust BPF programs is still experimental (a `bpf-linker` feature; a compiler-level
+  `#[btf_preserve_access]` is only a pre-RFC). So Rustwain's programs must not read
+  kernel structs. They work only on stable UAPI contexts (`__sk_buff`, `xdp_md`,
+  `bpf_sock_addr`) and helpers, which also means they **need no kernel BTF**.
+- Building the programs needs a **nightly** toolchain (`-Z build-std=core` for
+  `bpfel-unknown-none`) and `bpf-linker`. Isolated to the `rustwain-bpf` crate (see
+  [crate layout](../13-implementation/01-crate-layout.md#toolchains)).
 - Alternatives: `libbpf-rs` (Rust bindings to libbpf, programs in C) – more mature
   verifier-friendly C, but breaks the Rust-only rule.
 - Decision `[decided]`: **Aya**, programs in Rust. Risk: the BPF verifier is picky and
@@ -319,9 +326,13 @@ skip NAT entirely.
   copies entries, then swaps programs. Pain point in every eBPF project – design for it
   from the start.
 
-## Fallback: nftables backend
+## Fallback: nftables backend `[later]`
 
-For nodes without BTF / sufficient BPF features (or by choice):
+The kernel floor (5.15) already includes every hook the core dataplane uses, and the
+core programs need no kernel BTF, so a missing BTF is **not** a reason to fall back. The
+fallback is for hosts where BPF is unusable: no `CAP_BPF`/`CAP_SYS_ADMIN` (agent inside a
+restricted container), a security policy that forbids BPF, or an operator's choice. That
+makes it a M7-or-later item, not part of the first networking milestone:
 - `table inet rustwain` with sets and verdict maps:
   - Services: `map svc_vip_port : verdict` → `jump svc_<id>` chains with `numgen random
     mod N vmap` for backend selection → `dnat`.
