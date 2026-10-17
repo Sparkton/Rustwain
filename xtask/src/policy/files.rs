@@ -6,12 +6,28 @@ use crate::report::{Check, Finding, Location};
 
 const MESSAGE: &str = "non-Rust tooling file; automation lives in `cargo xtask` (AGENTS.md)";
 
-/// Compared case-insensitively.
-const FOREIGN_EXTENSIONS: &[&str] = &[
+/// Extensions of tooling in another language, which the project excludes (AGENTS.md).
+/// Compared case-insensitively. `flake.nix` and `BUILD.bazel` are caught by `nix` and
+/// `bazel`.
+const FOREIGN_EXTENSIONS: [&[&str]; 3] = [SCRIPT_EXTENSIONS, WEB_EXTENSIONS, OTHER_EXTENSIONS];
+
+/// Scripts and common languages.
+const SCRIPT_EXTENSIONS: &[&str] = &[
     "py", "pyi", "ipynb", "sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd", "js", "mjs",
     "cjs", "ts", "mts", "cts", "jsx", "tsx", "go", "rb", "pl", "pm", "php", "lua", "java", "kt",
     "kts", "scala", "groovy", "gradle", "swift", "c", "h", "cc", "cpp", "cxx", "hpp", "mk",
     "cmake",
+];
+
+/// Frontend and WASM files.
+const WEB_EXTENSIONS: &[&str] = &[
+    "html", "htm", "css", "scss", "sass", "less", "vue", "svelte", "wasm", "wat",
+];
+
+/// Other languages and build tooling.
+const OTHER_EXTENSIONS: &[&str] = &[
+    "zig", "cs", "fs", "dart", "nix", "bzl", "bazel", "awk", "tcl", "r", "jl", "ex", "exs", "erl",
+    "hs", "ml", "clj",
 ];
 
 /// Build and package manifests of other ecosystems; compared exactly.
@@ -35,6 +51,7 @@ const FOREIGN_FILE_NAMES: &[&str] = &[
     "go.mod",
     "build.gradle",
     "Rakefile",
+    "WORKSPACE",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +77,7 @@ impl TrackedFile {
         extension.is_some_and(|extension| {
             FOREIGN_EXTENSIONS
                 .iter()
+                .flat_map(|group| group.iter())
                 .any(|foreign| foreign.eq_ignore_ascii_case(extension))
         }) || name.is_some_and(|name| FOREIGN_FILE_NAMES.contains(&name))
             || (extension.is_none() && self.has_shebang)
@@ -116,6 +134,13 @@ mod tests {
             TrackedFile::new("bin/tool", true),
             TrackedFile::new("docs/example.md", true),
             TrackedFile::new("src/lib.rs", false),
+            TrackedFile::new("web/index.html", false),
+            TrackedFile::new("web/style.SCSS", false),
+            TrackedFile::new("web/app.wasm", false),
+            TrackedFile::new("flake.nix", false),
+            TrackedFile::new("tools/build.zig", false),
+            TrackedFile::new("BUILD.bazel", false),
+            TrackedFile::new("WORKSPACE", false),
         ];
 
         assert_eq!(
@@ -126,6 +151,13 @@ mod tests {
                 "Makefile:1",
                 "web/package.json:1",
                 "bin/tool:1",
+                "web/index.html:1",
+                "web/style.SCSS:1",
+                "web/app.wasm:1",
+                "flake.nix:1",
+                "tools/build.zig:1",
+                "BUILD.bazel:1",
+                "WORKSPACE:1",
             ]
         );
         assert_eq!(

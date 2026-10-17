@@ -3,7 +3,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
 };
 
 use super::{CommitMessage, CommitRange};
@@ -30,19 +30,25 @@ pub(super) enum Revisions<'a> {
 }
 
 impl<'a> Revisions<'a> {
-    /// Without a range: `origin/main..HEAD` if `origin/main` exists, else `HEAD` alone. A
-    /// first push has no base, so only its head commit is inspected.
+    /// The commits to inspect: `range`, or `origin/main..HEAD` without one. `resolves`
+    /// says whether a revision names a commit.
+    ///
+    /// Only the head commit is inspected when there is no usable base: the first push
+    /// of a branch (an all-zero base), no `origin/main`, or a base that no longer
+    /// resolves, such as the old tip after a force-push. A mistyped explicit base
+    /// therefore also falls back to the head commit instead of failing.
     pub(super) fn select(
         range: Option<&'a CommitRange>,
-        origin_main_exists: impl FnOnce() -> Result<bool, XtaskError>,
+        resolves: impl Fn(&str) -> Result<bool, XtaskError>,
     ) -> Result<Self, XtaskError> {
         Ok(match range {
             Some(range) if range.is_first_push() => Self::Only(&range.head),
-            Some(range) => Self::Span {
+            Some(range) if resolves(&range.base)? => Self::Span {
                 base: &range.base,
                 head: &range.head,
             },
-            None if origin_main_exists()? => Self::Span {
+            Some(range) => Self::Only(&range.head),
+            None if resolves(DEFAULT_BASE)? => Self::Span {
                 base: DEFAULT_BASE,
                 head: DEFAULT_HEAD,
             },
@@ -74,12 +80,47 @@ pub(super) fn commit_messages(
     Ok(parse_log(&output))
 }
 
-/// Whether `git` can resolve `name` to an object.
-pub(super) fn ref_exists(repo_root: &Path, name: &str) -> Result<bool, XtaskError> {
+/// Whether `revision` names a commit in this repository.
+pub(super) fn commit_exists(repo_root: &Path, revision: &str) -> Result<bool, XtaskError> {
+    let commit = format!("{revision}^{{commit}}");
+    succeeds(repo_root, &["cat-file", "-e", END_OF_OPTIONS, &commit])
+}
+
+/// The newest commit that both revisions descend from, or `None` if their histories share
+/// none.
+pub(super) fn merge_base(
+    repo_root: &Path,
+    first: &str,
+    second: &str,
+) -> Result<Option<String>, XtaskError> {
+    let args = ["merge-base", END_OF_OPTIONS, first, second];
+    let output = execute(repo_root, &args)?;
+    // `git merge-base` exits with 1 when there is no common ancestor.
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    stdout_of(&args, output).map(|commit| Some(commit.trim().to_owned()))
+}
+
+/// The text of `path` as it is at `revision`, or `None` if the revision has no such file.
+pub(super) fn file_at(
+    repo_root: &Path,
+    revision: &str,
+    path: &str,
+) -> Result<Option<String>, XtaskError> {
+    let object = format!("{revision}:{path}");
+    if !succeeds(repo_root, &["cat-file", "-e", END_OF_OPTIONS, &object])? {
+        return Ok(None);
+    }
+    run(repo_root, &["show", END_OF_OPTIONS, &object]).map(Some)
+}
+
+/// Runs `git` for its exit status alone, which is how `cat-file -e` answers.
+fn succeeds(repo_root: &Path, args: &[&str]) -> Result<bool, XtaskError> {
     let status = Command::new(GIT)
         .arg("-C")
         .arg(repo_root)
-        .args(["rev-parse", "--verify", "--quiet", name])
+        .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -107,14 +148,22 @@ fn parse_log(output: &str) -> Vec<CommitMessage> {
         .collect()
 }
 
+/// Runs `git` and returns its output, which must be UTF-8.
 fn run(repo_root: &Path, args: &[&str]) -> Result<String, XtaskError> {
-    let command = format!("{GIT} {}", args.join(" "));
-    let output = Command::new(GIT)
+    stdout_of(args, execute(repo_root, args)?)
+}
+
+fn execute(repo_root: &Path, args: &[&str]) -> Result<Output, XtaskError> {
+    Command::new(GIT)
         .arg("-C")
         .arg(repo_root)
         .args(args)
         .output()
-        .map_err(spawn_error)?;
+        .map_err(spawn_error)
+}
+
+fn stdout_of(args: &[&str], output: Output) -> Result<String, XtaskError> {
+    let command = format!("{GIT} {}", args.join(" "));
     if !output.status.success() {
         return Err(XtaskError::CommandFailed {
             command,
@@ -153,17 +202,22 @@ mod tests {
 
     #[test]
     fn revisions_follow_the_range_or_fall_back_to_what_exists() {
-        let zeros = "0".repeat(40);
         let range = CommitRange::new("main", "topic");
-        let first_push = CommitRange::new(zeros, "topic");
-        let exists = || Ok(true);
-        let absent = || Ok(false);
+        let force_pushed_away = CommitRange::new("deadbeef", "topic");
+        let first_push = CommitRange::new("0".repeat(40), "topic");
+        let resolves_main_only =
+            |revision: &str| Ok(revision == "main" || revision == "origin/main");
+        let never_asked = |_: &str| -> Result<bool, XtaskError> {
+            unreachable!("an all-zero base is not looked up")
+        };
+        let nothing_resolves = |_: &str| Ok(false);
 
         let selected = [
-            Revisions::select(Some(&range), exists),
-            Revisions::select(Some(&first_push), exists),
-            Revisions::select(None, exists),
-            Revisions::select(None, absent),
+            Revisions::select(Some(&range), resolves_main_only),
+            Revisions::select(Some(&force_pushed_away), resolves_main_only),
+            Revisions::select(Some(&first_push), never_asked),
+            Revisions::select(None, resolves_main_only),
+            Revisions::select(None, nothing_resolves),
         ]
         .map(Result::unwrap);
 
@@ -174,6 +228,7 @@ mod tests {
                     base: "main",
                     head: "topic"
                 },
+                Revisions::Only("topic"),
                 Revisions::Only("topic"),
                 Revisions::Span {
                     base: "origin/main",

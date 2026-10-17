@@ -84,10 +84,8 @@ fn append(repo_root: &Path, unterminated: bool, ids: &[PainPointId]) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs, path::PathBuf, process};
-
     use super::*;
-    use crate::tracker::load::TRACKER_PATH;
+    use crate::tracker::{load::TRACKER_PATH, temp_dir::TempDir};
 
     const TRACKER: &str = "\
 | ID | Item | Reason |
@@ -98,35 +96,10 @@ mod tests {
 | PP-03 | three again | r |
 ";
 
-    /// A scratch repository root that removes itself when dropped.
-    struct TempRepo {
-        root: PathBuf,
-    }
-
-    impl TempRepo {
-        fn new(test_name: &str) -> Self {
-            let root = env::temp_dir().join(format!("xtask-{}-{test_name}", process::id()));
-            let _ = fs::remove_dir_all(&root);
-            let repo = Self { root };
-            repo.write(TRACKER_PATH, TRACKER);
-            repo
-        }
-
-        fn write(&self, relative: &str, text: &str) {
-            let path = self.root.join(relative);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, text).unwrap();
-        }
-
-        fn lockfile(&self) -> Option<String> {
-            fs::read_to_string(self.root.join(LOCKFILE_PATH)).ok()
-        }
-    }
-
-    impl Drop for TempRepo {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
+    fn repo_with_tracker(test_name: &str) -> TempDir {
+        let repo = TempDir::new(test_name);
+        repo.write(TRACKER_PATH, TRACKER);
+        repo
     }
 
     fn ids(appended: &[PainPointId]) -> Vec<&str> {
@@ -135,27 +108,30 @@ mod tests {
 
     #[test]
     fn lock_ids_creates_the_lockfile_with_every_tracker_id_once() {
-        let repo = TempRepo::new("lock_ids_creates");
+        let repo = repo_with_tracker("lock_ids_creates");
 
-        let appended = lock_ids(&repo.root).unwrap();
+        let appended = lock_ids(repo.path()).unwrap();
 
         assert_eq!(ids(&appended), ["PP-01", "PP-02", "PP-03"]);
-        assert_eq!(repo.lockfile().as_deref(), Some("PP-01\nPP-02\nPP-03\n"));
+        assert_eq!(
+            repo.read(LOCKFILE_PATH).as_deref(),
+            Some("PP-01\nPP-02\nPP-03\n")
+        );
     }
 
     #[test]
     fn lock_ids_only_appends_and_a_second_run_changes_nothing() {
-        let repo = TempRepo::new("lock_ids_appends");
+        let repo = repo_with_tracker("lock_ids_appends");
         // Out of order, with a junk line and no final newline: all of it must survive.
         repo.write(LOCKFILE_PATH, "PP-03\njunk\nPP-02");
 
-        let first = lock_ids(&repo.root).unwrap();
-        let after_first = repo.lockfile();
-        let second = lock_ids(&repo.root).unwrap();
+        let first = lock_ids(repo.path()).unwrap();
+        let after_first = repo.read(LOCKFILE_PATH);
+        let second = lock_ids(repo.path()).unwrap();
 
         assert_eq!(ids(&first), ["PP-01"]);
         assert_eq!(after_first.as_deref(), Some("PP-03\njunk\nPP-02\nPP-01\n"));
         assert_eq!(ids(&second), Vec::<&str>::new());
-        assert_eq!(repo.lockfile(), after_first);
+        assert_eq!(repo.read(LOCKFILE_PATH), after_first);
     }
 }
