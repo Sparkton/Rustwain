@@ -6,7 +6,8 @@ are. Update the **Status** column as work lands. IDs are stable – reference th
 design docs, issues and commits (`PP-53`).
 
 **Status values:** `designed` (doc exists) · `building` · `done` (implemented + tested) ·
-`deferred` · `won't fix` (with reason) · `open` (no answer yet).
+`deferred` · `won't fix` · `open` (no answer yet). The Status cell holds only the bare
+word; give the reason for a `won't fix` in the row's Trade-off or Reason cell.
 
 **Severity** (how much it hurts Kubernetes users in practice): `H` high · `M` medium · `L` low.
 

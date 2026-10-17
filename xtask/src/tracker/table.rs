@@ -5,8 +5,6 @@
 //! starts with three backticks or three tildes, without matching the fence kind or
 //! length. The tracker has no nested fences.
 
-use std::ops::Range;
-
 const ID_COLUMN: &str = "ID";
 const STATUS_COLUMN: &str = "Status";
 const SEVERITY_COLUMN: &str = "Sev";
@@ -109,23 +107,21 @@ fn is_separator_cell(cell: &str) -> bool {
     !dashes.is_empty() && dashes.chars().all(|c| c == '-')
 }
 
-/// The trimmed cells of a table line. `\|` is a literal pipe, and a pipe inside an inline
-/// code span does not end the cell.
+/// The trimmed cells of a table line. Every unescaped `|` ends a cell, inside an inline
+/// code span too, which is how GFM renders a table. `\|` is a literal pipe.
 fn split_cells(line: &str) -> Vec<String> {
     let line = line.trim();
     let body = line.strip_prefix('|').unwrap_or(line);
-    let code_spans = code_span_ranges(body);
     let mut cells = Vec::new();
     let mut cell = String::new();
-    let mut chars = body.char_indices().peekable();
-    while let Some((position, c)) = chars.next() {
-        let in_code = code_spans.iter().any(|span| span.contains(&position));
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
-            '\\' if chars.peek().is_some_and(|&(_, next)| next == '|') => {
+            '\\' if chars.peek() == Some(&'|') => {
                 chars.next();
                 cell.push('|');
             }
-            '|' if !in_code => cells.push(std::mem::take(&mut cell).trim().to_owned()),
+            '|' => cells.push(std::mem::take(&mut cell).trim().to_owned()),
             _ => cell.push(c),
         }
     }
@@ -136,57 +132,17 @@ fn split_cells(line: &str) -> Vec<String> {
     cells
 }
 
-/// Byte ranges strictly between the backtick runs of each inline code span. A run opens
-/// a span only if a later run of the same length closes it; otherwise it is literal.
-fn code_span_ranges(text: &str) -> Vec<Range<usize>> {
-    let mut runs = backtick_runs(text).into_iter();
-    let mut spans = Vec::new();
-    while let Some((open_start, length)) = runs.next() {
-        let Some((close_start, _)) = runs.clone().find(|&(_, other)| other == length) else {
-            continue;
-        };
-        spans.push(open_start + length..close_start);
-        // Skip the runs inside the span and its closing run.
-        for _ in runs.by_ref().take_while(|&(start, _)| start != close_start) {}
-    }
-    spans
-}
-
-/// `(start byte, length)` of each maximal run of backticks.
-fn backtick_runs(text: &str) -> Vec<(usize, usize)> {
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    let mut previous_end = None;
-    for (position, _) in text.match_indices('`') {
-        match runs.last_mut() {
-            Some((_, length)) if previous_end == Some(position) => *length += 1,
-            _ => runs.push((position, 1)),
-        }
-        previous_end = Some(position + 1);
-    }
-    runs
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn cells_split_on_pipes_except_escaped_ones_and_those_in_code_spans() {
-        let line = r"| PP-01 | a \| b | `x | y` | ``p | q`` | stray ` tick | z |";
+    fn cells_split_on_every_unescaped_pipe_including_inside_code_spans() {
+        let line = r"| PP-01 | a \| b | `x \| y` | `p | q` | z |";
 
         let cells = split_cells(line);
 
-        assert_eq!(
-            cells,
-            [
-                "PP-01",
-                "a | b",
-                "`x | y`",
-                "``p | q``",
-                "stray ` tick",
-                "z"
-            ]
-        );
+        assert_eq!(cells, ["PP-01", "a | b", "`x | y`", "`p", "q`", "z"]);
     }
 
     #[test]

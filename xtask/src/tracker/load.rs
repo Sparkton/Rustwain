@@ -38,8 +38,13 @@ impl SourceText {
 pub fn load(repo_root: &Path) -> Result<TrackerInput, XtaskError> {
     Ok(TrackerInput {
         tracker: read_source(repo_root, TRACKER_PATH)?,
-        lockfile: read_optional_source(repo_root, LOCKFILE_PATH)?,
+        lockfile: load_lockfile(repo_root)?,
     })
+}
+
+/// The lockfile as it is on disk, or `None` when it does not exist.
+pub fn load_lockfile(repo_root: &Path) -> Result<Option<SourceText>, XtaskError> {
+    read_optional_source(repo_root, LOCKFILE_PATH)
 }
 
 fn read_source(repo_root: &Path, relative: &str) -> Result<SourceText, XtaskError> {

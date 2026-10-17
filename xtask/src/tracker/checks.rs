@@ -11,14 +11,20 @@ use super::{
     load::{LOCKFILE_PATH, SourceText, TrackerInput},
     lockfile::{LockLine, parse_lockfile},
     model::{PainPointId, PainPointSeverity, PainPointStatus, TrackerRow},
-    table::{TableRow, TableSchema, id_tables},
+    table::{IdTable, TableRow, TableSchema, id_tables},
 };
 use crate::report::{Check, Finding, Location};
 
 /// Runs `TrackerSchema` and `TrackerIds`.
+///
+/// A tracker with no recognised ID table gets only the one `TrackerSchema` finding that
+/// says so. Without it, every locked ID would also be reported as removed.
 pub fn check(input: &TrackerInput) -> Vec<Finding> {
-    let (rows, mut findings) = parse_rows(&input.tracker);
-    findings.extend(tracker_ids(&rows, input));
+    let tables = id_tables(&input.tracker.text);
+    let (rows, mut findings) = parse_tables(&input.tracker, &tables);
+    if !tables.is_empty() {
+        findings.extend(tracker_ids(&rows, input));
+    }
     findings
 }
 
@@ -27,9 +33,16 @@ pub fn check(input: &TrackerInput) -> Vec<Finding> {
 /// A row whose ID parses is returned even when another cell is malformed, so that one
 /// bad cell is not also reported as a removed ID.
 pub fn parse_rows(tracker: &SourceText) -> (Vec<TrackerRow>, Vec<Finding>) {
+    parse_tables(tracker, &id_tables(&tracker.text))
+}
+
+fn parse_tables(tracker: &SourceText, tables: &[IdTable]) -> (Vec<TrackerRow>, Vec<Finding>) {
+    if tables.is_empty() {
+        return (Vec::new(), vec![no_id_tables(tracker)]);
+    }
     let mut rows = Vec::new();
     let mut findings = Vec::new();
-    for table in id_tables(&tracker.text) {
+    for table in tables {
         for raw in &table.rows {
             let location = Location::from_index(&tracker.path, raw.index);
             let (row, problems) = parse_row(&table.schema, raw, &location);
@@ -46,9 +59,20 @@ pub fn parse_rows(tracker: &SourceText) -> (Vec<TrackerRow>, Vec<Finding>) {
     (rows, findings)
 }
 
-/// Rows whose cells do not match their table's schema.
+/// Rows whose cells do not match their table's schema, or the one finding that no ID
+/// table was found.
 pub fn tracker_schema(tracker: &SourceText) -> Vec<Finding> {
     parse_rows(tracker).1
+}
+
+fn no_id_tables(tracker: &SourceText) -> Finding {
+    Finding::error(
+        Check::TrackerSchema,
+        Some(Location::new(&tracker.path, NonZeroU32::MIN)),
+        "no `ID` tables found in the tracker; likely causes: a header whose first cell is not \
+         exactly `ID` (such as `Id`), a header without a `|---|` separator row under it, or an \
+         unclosed code fence hiding the tables",
+    )
 }
 
 /// Duplicate IDs, IDs missing from the lockfile, and locked IDs removed from the tracker.
@@ -108,7 +132,11 @@ impl fmt::Display for SchemaProblem {
             }
             Self::InvalidStatus(cell) => {
                 let allowed = PainPointStatus::ALL.map(PainPointStatus::name).join(", ");
-                write!(f, "status `{cell}` must be one of {allowed}")
+                write!(
+                    f,
+                    "status `{cell}` must be one of {allowed}; the cell holds only the word, so \
+                     put a reason in the Trade-off or Reason cell"
+                )
             }
         }
     }
@@ -271,7 +299,7 @@ mod tests {
         "| ID | Pain point | Sev | Rustwain answer | Trade-off | Doc | Status |",
         "|---|---|---|---|---|---|---|",
         "| PP-01 | Too many components | H | One binary | — | [doc](a.md) | designed |",
-        r"| PP-5H | Escaped \| pipe and `code \| pipe` | M | `a|b` | — | — | won't fix |",
+        r"| PP-5H | Escaped \| pipe and `code \| pipe` | M | `a\|b` | — | — | won't fix |",
         "",
         "```",
         "| ID | Example |",
@@ -447,7 +475,7 @@ mod tests {
             "| PP-01 | too few cells | H | a | b | designed |",
             "| PP-1 | bad id | H | a | b | c | designed |",
             "| PP-02 | bad sev | X | a | b | c | designed |",
-            "| PP-03 | bad status | H | a | b | c | shipped |",
+            "| PP-03 | bad status | H | a | b | c | won't fix (obsolete) |",
             "| PP-04 | fine | L | a | b | c | open |",
         ];
 
@@ -495,9 +523,37 @@ mod tests {
                     Check::TrackerSchema,
                     Severity::Error,
                     Some(6),
-                    "status `shipped` must be one of designed, building, done, deferred, won't fix, open"
+                    "status `won't fix (obsolete)` must be one of designed, building, done, deferred, won't fix, open; the cell holds only the word, so put a reason in the Trade-off or Reason cell"
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_tracker_without_id_tables_is_one_error_not_a_flood_of_removed_ids() {
+        let misspelled_header = [
+            "| Id | Item | Reason |",
+            "|---|---|---|",
+            "| PP-W1 | a | r |",
+        ];
+        let unclosed_fence = [
+            "```",
+            "| ID | Item | Reason |",
+            "|---|---|---|",
+            "| PP-W1 | a | r |",
+        ];
+        let locked = ["PP-W1", "PP-W2", "PP-W3"];
+
+        let misspelled = check(&input(&misspelled_header, &locked));
+        let unclosed = check(&input(&unclosed_fence, &locked));
+
+        let expected = [error_at(
+            Check::TrackerSchema,
+            TRACKER_PATH,
+            1,
+            "no `ID` tables found in the tracker; likely causes: a header whose first cell is not exactly `ID` (such as `Id`), a header without a `|---|` separator row under it, or an unclosed code fence hiding the tables",
+        )];
+        assert_eq!(misspelled, expected);
+        assert_eq!(unclosed, expected);
     }
 }
